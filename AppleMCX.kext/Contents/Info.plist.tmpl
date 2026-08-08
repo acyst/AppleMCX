@@ -1,0 +1,122 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>AppleMCX</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.applemcx.driver</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>AppleMCX</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSPrincipalClass</key>
+	<string>com.apple.kernel.iokit</string>
+	<key>OSBundleCompatibleVersion</key>
+	<string>0.1.0</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>20.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>20.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>20.0</string>
+		<key>com.apple.kpi.network</key>
+		<string>20.0</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Root</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<!--
+			Personality 1: PCI 绑定层（核心层）
+			通用 Mellanox 适配器框架: 覆盖 ConnectX-4 ~ ConnectX-8 及 BlueField 全家族。
+			IOPCIMatch 值由 Tools/gen_pci_match.sh 生成, 格式为 0xDDDDVVVV 以空格分隔:
+			  0x101315b3 ... (设备ID, 厂商ID)
+			仅默认启用 ConnectX-5 (0x101715b3) 作为首个实现; 其余型号按需打开注释。
+		-->
+		<key>MlxPCIDriver</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.applemcx.driver</string>
+			<key>IOClass</key>
+			<string>MlxPCIDriver</string>
+			<key>IOMatchCategory</key>
+			<string>MlxPCIDriver</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!--
+			IOPCIMatch (全家族, 按需启用):
+			0x101315b3 0x101415b3 0x101515b3 0x101615b3  ConnectX-4/4LX (PF/VF)
+			0x101715b3 0x101815b3 0x101915b3 0x101a15b3  ConnectX-5/5Ex (PF/VF)
+			0x101b15b3 0x101c15b3 0x101d15b3 0x101e15b3  ConnectX-6/6Dx (PF/VF)
+			0x101f15b3                                   ConnectX-6LX
+			0x102115b3 0x102315b3                        ConnectX-7/8
+			0xa2d215b3 0xa2d315b3 0xa2d615b3 0xa2dc15b3  BlueField-1/2/3
+			-->
+		<key>IOPCIMatch</key>
+		<string>0x101315b3 0x101715b3 0x101b15b3 0x101d15b3 0x101f15b3 0x102115b3 0x102315b3 0xa2dc15b3 0xa2df15b3</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
+		</dict>
+
+		<!--
+			Personality 2: RDMA verbs 层 (通用, 与硬件型号解耦)
+			Match: 核心层发布的 nub (mlx_rdma = true)
+			无论 PF 对应 ConnectX-5/6/7, 均由同一 MlxRoCE 类驱动。
+		-->
+		<key>MlxRoCE</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.applemcx.driver</string>
+			<key>IOClass</key>
+			<string>MlxRoCE</string>
+			<key>IOMatchCategory</key>
+			<string>MlxRoCE</string>
+			<key>IOProviderClass</key>
+			<string>IOService</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>mlx_rdma</key>
+				<true/>
+			</dict>
+		</dict>
+
+		<!--
+			Personality 3: 以太网接口层 (通用)
+			Match: 核心层发布的 nub (mlx_eth = true)
+		-->
+		<key>MlxEthernetDriver</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.applemcx.driver</string>
+			<key>IOClass</key>
+			<string>MlxEthernetDriver</string>
+			<key>IOMatchCategory</key>
+			<string>MlxEthernetDriver</string>
+			<key>IOProviderClass</key>
+			<string>IOService</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
+			<key>IOPropertyMatch</key>
+			<dict>
+				<key>mlx_eth</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>

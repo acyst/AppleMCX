@@ -1,0 +1,13 @@
+# 构建产物
+obj/
+build/
+AppleMCX.kext/Contents/MacOS/AppleMCX
+
+# Xcode
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# 系统
+.DS_Store
+*.dSYM

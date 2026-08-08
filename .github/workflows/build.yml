@@ -1,0 +1,51 @@
+name: Build AppleMCX.kext
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    strategy:
+      matrix:
+        arch: [arm64e, x86_64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          sw_vers
+          xcodebuild -version
+          echo "SDK: $(xcrun --sdk macosx --show-sdk-path)"
+
+      - name: Build kernel KEXT
+        run: |
+          make clean || true
+          make ARCH=${{ matrix.arch }}
+
+      - name: Verify KEXT bundle
+        run: |
+          test -f AppleMCX.kext/Contents/MacOS/AppleMCX
+          test -f AppleMCX.kext/Contents/Info.plist
+          file AppleMCX.kext/Contents/MacOS/AppleMCX
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" AppleMCX.kext/Contents/Info.plist
+
+      - name: Build userspace toolchain
+        run: |
+          cd usermode/toolchain && make
+
+      - name: Upload KEXT artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppleMCX.kext-${{ matrix.arch }}
+          path: AppleMCX.kext
+          if-no-files-found: error
