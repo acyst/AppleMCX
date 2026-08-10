@@ -12,9 +12,18 @@
 #include "MlxPCIDriver.hpp"
 
 #include <string.h>
+#include <libkern/OSTypes.h>
+#include <libkern/OSByteOrder.h>
+#include <libkern/OSAtomic.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
-#include <libkern/OSByteOrder.h>
+#include <IOKit/IOKitDebug.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOMemoryMap.h>
+#include <IOKit/IOService.h>
+#include <IOKit/IOBSD.h>
+#include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxCmd, OSObject)

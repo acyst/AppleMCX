@@ -31,7 +31,7 @@ KERNEL_INC := \
 
 CFLAGS := -Wall -Wextra -Wno-unused-parameter -std=c++17 \
     -nostdinc -fno-builtin -fno-exceptions -fno-rtti \
-    -mkernel -msoft-float -fno-stack-protector \
+    -mkernel -fapple-kext -fno-stack-protector \
     -fno-threadsafe-statics -fno-c++-static-destructors \
     -DKERNEL -D__KERNEL__ -DAPPLE \
     -arch $(ARCH) -mmacosx-version-min=13.0 \
