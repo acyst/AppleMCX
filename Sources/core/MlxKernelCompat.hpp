@@ -20,12 +20,19 @@ mlxMemoryBarrier()
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+/* Convert an IOVirtualAddress to a typed kernel pointer (integer→pointer). */
+static inline volatile uint32_t *
+mlxVirtToReg(IOVirtualAddress vaddr, uintptr_t offset)
+{
+    uintptr_t addr = static_cast<uintptr_t>(vaddr) + offset;
+    return reinterpret_cast<volatile uint32_t *>(addr);
+}
+
 /* mlx5 init-segment registers use big-endian 32-bit MMIO accesses. */
 static inline uint32_t
 mlxMMIORead32BE(IOMemoryMap *map, uintptr_t offset)
 {
-    volatile uint32_t *reg = reinterpret_cast<volatile uint32_t *>(
-        reinterpret_cast<uintptr_t>(map->getVirtualAddress()) + offset);
+    volatile uint32_t *reg = mlxVirtToReg(map->getVirtualAddress(), offset);
     uint32_t value = *reg;
     OSSynchronizeIO();
     return OSSwapBigToHostInt32(value);
@@ -34,8 +41,7 @@ mlxMMIORead32BE(IOMemoryMap *map, uintptr_t offset)
 static inline void
 mlxMMIOWrite32BE(IOMemoryMap *map, uintptr_t offset, uint32_t value)
 {
-    volatile uint32_t *reg = reinterpret_cast<volatile uint32_t *>(
-        reinterpret_cast<uintptr_t>(map->getVirtualAddress()) + offset);
+    volatile uint32_t *reg = mlxVirtToReg(map->getVirtualAddress(), offset);
     *reg = OSSwapHostToBigInt32(value);
     OSSynchronizeIO();
 }
