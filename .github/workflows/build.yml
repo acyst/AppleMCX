@@ -40,14 +40,42 @@ jobs:
         run: |
           make -C usermode/toolchain
 
+      - name: Import signing certificate
+        if: env.P12_BASE64 != ''
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain-db
+          security create-keychain -p build "$KEYCHAIN" || true
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p build "$KEYCHAIN"
+          echo "$P12_BASE64" | base64 -d > /tmp/sign.p12
+          security import /tmp/sign.p12 -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN"
+          rm -f /tmp/sign.p12
+          security find-identity -v -p codesigning
+
       - name: Package userspace toolchain (.pkg)
         run: |
           make pkg
 
-      - name: Upload pkg artifact
+      - name: Sign and package KEXT (.pkg)
+        run: |
+          IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | \
+              grep -oE '"[^"]+"' | head -1 | tr -d '"' || true)
+          if [ -n "$IDENTITY" ]; then
+            echo "==> 使用证书签名: $IDENTITY"
+            ./Tools/make_kext_pkg.sh "$IDENTITY"
+          else
+            echo "==> 未找到证书, 使用 ad-hoc 签名"
+            ./Tools/make_kext_pkg.sh -
+          fi
+
+      - name: Upload pkg artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AppleMCX-toolchain.pkg
+          name: AppleMCX-pkgs
           path: dist/*.pkg
           if-no-files-found: error
 
