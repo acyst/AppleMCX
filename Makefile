@@ -50,7 +50,7 @@ LDFLAGS := -arch $(ARCH) -nostdlib -Wl,-kext \
     $(if $(KEXT_STUB),-lcc_kext -lcplusplus,-undefined dynamic_lookup)
 
 # ---- 目标 ----
-.PHONY: all clean load unload sign deploy status tools
+.PHONY: all clean load unload sign deploy status tools pkg
 
 all: AppleMCX.kext/Contents/MacOS/$(KEXT_NAME) AppleMCX.kext/Contents/Info.plist
 
@@ -70,6 +70,10 @@ AppleMCX.kext/Contents/Info.plist: AppleMCX.kext/Contents/Info.plist.tmpl
 # ---- 用户态工具链 ----
 tools:
 	$(MAKE) -C usermode/toolchain
+
+# ---- 打包 userspace toolchain 为 .pkg ----
+pkg:
+	./Tools/make_pkg.sh
 
 # ---- 签名 (Apple Silicon 必需) ----
 sign:

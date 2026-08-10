@@ -218,12 +218,14 @@ enum {
 
 /* Compute static checks
  * Note: AV is 48 bytes (the original driver is not packed, includes alignment padding) */
+#if defined(__cplusplus)
 static_assert(sizeof(struct MlxWqeCtrlSeg) == 16, "ctrl seg must be 16 bytes");
 static_assert(sizeof(struct MlxWqeDataSeg) == 16,  "data seg must be 16 bytes");
 static_assert(sizeof(struct MlxWqeRaddrSeg) == 16, "raddr seg must be 16 bytes");
 static_assert(sizeof(struct MlxWqeEthSeg) == 16,   "eth seg must be 16 bytes");
 static_assert(sizeof(struct MlxAV) == 48,          "AV must be 48 bytes");
 static_assert(sizeof(struct MlxCqe64) == 64,       "CQE64 must be 64 bytes");
+#endif
 
 /*
  * WQE opcodes (See wr.c)

@@ -40,8 +40,6 @@ int mft_fw_cmd(mft_dev *dev, uint16_t opcode, uint16_t op_mod,
                uint8_t *out, uint32_t *out_size);
 
 /* Port statistics */
-int mft_port_stats(mft_dev *dev, struct mft_port_stats *stats);
-
 struct mft_port_stats {
     uint64_t rx_pkts, tx_pkts, rx_bytes, tx_bytes;
     uint64_t rx_drop, tx_drop, rx_errors, tx_errors;
@@ -49,6 +47,8 @@ struct mft_port_stats {
     uint8_t  link_state;
     uint8_t  port_num;
 };
+
+int mft_port_stats(mft_dev *dev, struct mft_port_stats *stats);
 
 /* Health status */
 int mft_health(mft_dev *dev, uint32_t *healthy);

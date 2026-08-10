@@ -13,9 +13,6 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
-    strategy:
-      matrix:
-        arch: [arm64e, x86_64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,7 +27,7 @@ jobs:
       - name: Build kernel KEXT
         run: |
           make clean || true
-          make ARCH=${{ matrix.arch }}
+          make ARCH=arm64e
 
       - name: Verify KEXT bundle
         run: |
@@ -43,9 +40,20 @@ jobs:
         run: |
           make -C usermode/toolchain
 
+      - name: Package userspace toolchain (.pkg)
+        run: |
+          make pkg
+
+      - name: Upload pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AppleMCX-toolchain.pkg
+          path: dist/*.pkg
+          if-no-files-found: error
+
       - name: Upload KEXT artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AppleMCX.kext-${{ matrix.arch }}
+          name: AppleMCX.kext-arm64e
           path: AppleMCX.kext
           if-no-files-found: error

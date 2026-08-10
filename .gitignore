@@ -1,7 +1,17 @@
 # 构建产物
 obj/
 build/
+dist/
 AppleMCX.kext/Contents/MacOS/AppleMCX
+# userspace toolchain binaries
+usermode/toolchain/ibv_devinfo
+usermode/toolchain/ib_*_bw
+usermode/toolchain/ib_*_lat
+usermode/toolchain/mlxconfig
+usermode/toolchain/mlxstatus
+usermode/toolchain/mlxlink
+usermode/toolchain/mlxreg
+usermode/toolchain/mlnx_qos
 
 # Xcode
 *.xcworkspace/

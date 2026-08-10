@@ -18,7 +18,7 @@
 #define REG_QTCT       0x0A00   /* Queue Type to TC */
 #define REG_QPDPM      0x5006   /* DSCP to Priority */
 
-static const char *devname = "mlx5_0";
+static const char *g_devname = "mlx5_0";
 
 static void
 usage(void)
@@ -121,7 +121,7 @@ int main(int argc, char **argv)
 
     while (i < argc) {
         if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
-            devname = argv[i + 1];
+            g_devname = argv[i + 1];
             i += 2;
         } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
             pfc = argv[i + 1];
@@ -141,9 +141,9 @@ int main(int argc, char **argv)
     if (!pfc && !prio_tc)
         do_query = 1;
 
-    mft_dev *dev = mft_open(devname);
+    mft_dev *dev = mft_open(g_devname);
     if (!dev) {
-        printf("Error: cannot open device %s\n", devname);
+        printf("Error: cannot open device %s\n", g_devname);
         return 1;
     }
 
