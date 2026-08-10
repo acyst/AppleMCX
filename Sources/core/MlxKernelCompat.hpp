@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <libkern/OSAtomic.h>
 #include <libkern/OSByteOrder.h>
+#include <libkern/c++/OSData.h>
 #include <IOKit/IOMemoryDescriptor.h>
 
 /* Order regular memory accesses before/after DMA ownership transitions. */
@@ -18,6 +19,17 @@ static inline void
 mlxMemoryBarrier()
 {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+/* OSArray only stores OSObject instances; use OSData for plain records. */
+template <typename T>
+static inline T *
+mlxRecordValue(OSObject *object)
+{
+    OSData *record = OSDynamicCast(OSData, object);
+    if (!record || record->getLength() != sizeof(T))
+        return NULL;
+    return static_cast<T *>(const_cast<void *>(record->getBytesNoCopy()));
 }
 
 /* Convert an IOVirtualAddress to a typed kernel pointer (integer→pointer). */

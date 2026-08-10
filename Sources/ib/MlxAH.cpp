@@ -8,6 +8,7 @@
 #include "MlxRoCE.hpp"
 #include "MlxPCIDriver.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -78,9 +79,19 @@ kern_return_t MlxAH::createAH(const struct mlx_create_ah_req *req,
     /* Encode the AV */
     encodeAV(req, &ctx->av);
 
+    OSData *record = OSData::withBytesNoCopy(ctx, sizeof(*ctx));
+    if (!record) {
+        IOFree(ctx, sizeof(MlxAHContext));
+        return kIOReturnNoMemory;
+    }
     IOLockLock(fLock);
-    fAhTable->setObject(ctx);
+    bool added = fAhTable->setObject(record);
     IOLockUnlock(fLock);
+    record->release();
+    if (!added) {
+        IOFree(ctx, sizeof(MlxAHContext));
+        return kIOReturnNoMemory;
+    }
 
     resp->ahHandle = ctx->ahHandle;
 
@@ -94,7 +105,8 @@ kern_return_t MlxAH::destroyAH(uint32_t ahHandle)
 {
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fAhTable->getCount(); i++) {
-        MlxAHContext *ctx = (MlxAHContext *)fAhTable->getObject(i);
+        MlxAHContext *ctx = mlxRecordValue<MlxAHContext>(
+            fAhTable->getObject(i));
         if (ctx && ctx->ahHandle == ahHandle) {
             fAhTable->removeObject(i);
             IOFree(ctx, sizeof(MlxAHContext));
@@ -111,7 +123,8 @@ MlxAHContext *MlxAH::lookup(uint32_t ahHandle)
     MlxAHContext *found = NULL;
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fAhTable->getCount(); i++) {
-        MlxAHContext *ctx = (MlxAHContext *)fAhTable->getObject(i);
+        MlxAHContext *ctx = mlxRecordValue<MlxAHContext>(
+            fAhTable->getObject(i));
         if (ctx && ctx->ahHandle == ahHandle) {
             found = ctx;
             break;

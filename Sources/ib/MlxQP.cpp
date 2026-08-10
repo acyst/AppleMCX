@@ -10,6 +10,7 @@
 #include "MlxPCIDriver.hpp"
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -118,28 +119,49 @@ kern_return_t MlxQP::createQP(const struct mlx_create_qp_req *req,
 
     /* Record the QP context */
     MlxQPContext *ctx = (MlxQPContext *)IOMallocZero(sizeof(MlxQPContext));
-    if (ctx) {
-        ctx->qpNum = qpn;
-        ctx->state = MLX_QP_STATE_RST;
-        ctx->st = st;
-        ctx->pd = req->pd;
-        ctx->sqSize = req->sqSize;
-        ctx->rqSize = req->rqSize;
-        ctx->sqBufAddr = req->sqBufAddr;
-        ctx->rqBufAddr = req->rqBufAddr;
-        ctx->dbRecordOffset = req->dbRecordOffset;
-        ctx->bfOffset = req->bfOffset;
-        ctx->sqPhys = sqPhys;
-        ctx->rqPhys = rqPhys;
-        ctx->sqPinned = (sqReq.memDesc != NULL);
-        ctx->rqPinned = (rqReq.memDesc != NULL);
-        if (ctx->sqPinned)
-            ctx->sqDma = sqReq;
-        if (ctx->rqPinned)
-            ctx->rqDma = rqReq;
-        IOLockLock(fLock);
-        fQpTable->setObject(ctx);
-        IOLockUnlock(fLock);
+    if (!ctx) {
+        destroyQP(qpn);
+        if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
+        if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
+        return kIOReturnNoMemory;
+    }
+    ctx->qpNum = qpn;
+    ctx->state = MLX_QP_STATE_RST;
+    ctx->st = st;
+    ctx->pd = req->pd;
+    ctx->sqSize = req->sqSize;
+    ctx->rqSize = req->rqSize;
+    ctx->sqBufAddr = req->sqBufAddr;
+    ctx->rqBufAddr = req->rqBufAddr;
+    ctx->dbRecordOffset = req->dbRecordOffset;
+    ctx->bfOffset = req->bfOffset;
+    ctx->sqPhys = sqPhys;
+    ctx->rqPhys = rqPhys;
+    ctx->sqPinned = (sqReq.memDesc != NULL);
+    ctx->rqPinned = (rqReq.memDesc != NULL);
+    if (ctx->sqPinned)
+        ctx->sqDma = sqReq;
+    if (ctx->rqPinned)
+        ctx->rqDma = rqReq;
+
+    OSData *record = OSData::withBytesNoCopy(ctx, sizeof(*ctx));
+    if (!record) {
+        IOFree(ctx, sizeof(MlxQPContext));
+        destroyQP(qpn);
+        if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
+        if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
+        return kIOReturnNoMemory;
+    }
+    IOLockLock(fLock);
+    bool added = fQpTable->setObject(record);
+    IOLockUnlock(fLock);
+    record->release();
+    if (!added) {
+        IOFree(ctx, sizeof(MlxQPContext));
+        destroyQP(qpn);
+        if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
+        if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
+        return kIOReturnNoMemory;
     }
 
     IOLog("MlxQP: QP[%u] created type=%s sq=%u rq=%u\n",
@@ -276,7 +298,8 @@ kern_return_t MlxQP::destroyQP(uint32_t qpn)
     if (kr == kIOReturnSuccess) {
         IOLockLock(fLock);
         for (uint32_t i = 0; i < fQpTable->getCount(); i++) {
-            MlxQPContext *ctx = (MlxQPContext *)fQpTable->getObject(i);
+            MlxQPContext *ctx = mlxRecordValue<MlxQPContext>(
+                fQpTable->getObject(i));
             if (ctx && ctx->qpNum == qpn) {
                 /* Release the DMA pins */
                 if (ctx->sqPinned)
@@ -312,7 +335,8 @@ MlxQPContext *MlxQP::lookup(uint32_t qpn)
     MlxQPContext *found = NULL;
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fQpTable->getCount(); i++) {
-        MlxQPContext *ctx = (MlxQPContext *)fQpTable->getObject(i);
+        MlxQPContext *ctx = mlxRecordValue<MlxQPContext>(
+            fQpTable->getObject(i));
         if (ctx && ctx->qpNum == qpn) {
             found = ctx;
             break;

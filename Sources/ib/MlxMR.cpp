@@ -10,6 +10,7 @@
 #include "MlxPCIDriver.hpp"
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -148,10 +149,11 @@ kern_return_t MlxMR::regMR(const struct mlx_reg_mr_req *req,
         return kIOReturnBadArgument;
 
     /* Pin user memory (see ib_umem_get, mr.c) */
-    IOMemoryDescriptor *mem = IOMemoryDescriptor::withTask(
-        kernel_task, req->startAddr, req->length,
+    IOMemoryDescriptor *mem = IOMemoryDescriptor::withAddressRange(
+        req->startAddr, req->length,
         (req->accessFlags & (MLX_MKC_ACCESS_LW | MLX_MKC_ACCESS_RW)) ?
-            kIODirectionInOut : kIODirectionIn, NULL);
+            kIODirectionInOut : kIODirectionIn,
+        current_task());
     if (!mem)
         return kIOReturnNoMemory;
     if (mem->prepare(kIODirectionInOut) != kIOReturnSuccess) {
@@ -191,9 +193,30 @@ kern_return_t MlxMR::regMR(const struct mlx_reg_mr_req *req,
         ctx->length = req->length;
         ctx->accessFlags = req->accessFlags;
         ctx->fMemDesc = mem;
+        OSData *record = OSData::withBytesNoCopy(ctx, sizeof(*ctx));
+        if (!record) {
+            IOFree(ctx, sizeof(MlxMRContext));
+            cmdDestroyMKey(mkey);
+            mem->complete();
+            mem->release();
+            return kIOReturnNoMemory;
+        }
         IOLockLock(fLock);
-        fMrTable->setObject(ctx);
+        bool added = fMrTable->setObject(record);
         IOLockUnlock(fLock);
+        record->release();
+        if (!added) {
+            IOFree(ctx, sizeof(MlxMRContext));
+            cmdDestroyMKey(mkey);
+            mem->complete();
+            mem->release();
+            return kIOReturnNoMemory;
+        }
+    } else {
+        cmdDestroyMKey(mkey);
+        mem->complete();
+        mem->release();
+        return kIOReturnNoMemory;
     }
 
     resp->mrHandle = mkey;
@@ -211,7 +234,8 @@ kern_return_t MlxMR::deregMR(uint32_t mrHandle)
     if (kr == kIOReturnSuccess) {
         IOLockLock(fLock);
         for (uint32_t i = 0; i < fMrTable->getCount(); i++) {
-            MlxMRContext *ctx = (MlxMRContext *)fMrTable->getObject(i);
+            MlxMRContext *ctx = mlxRecordValue<MlxMRContext>(
+                fMrTable->getObject(i));
             if (ctx && ctx->mrHandle == mrHandle) {
                 if (ctx->fMemDesc) {
                     ctx->fMemDesc->complete();
@@ -232,7 +256,8 @@ MlxMRContext *MlxMR::lookup(uint32_t mrHandle)
     MlxMRContext *found = NULL;
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fMrTable->getCount(); i++) {
-        MlxMRContext *ctx = (MlxMRContext *)fMrTable->getObject(i);
+        MlxMRContext *ctx = mlxRecordValue<MlxMRContext>(
+            fMrTable->getObject(i));
         if (ctx && ctx->mrHandle == mrHandle) {
             found = ctx;
             break;

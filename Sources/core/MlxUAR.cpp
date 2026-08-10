@@ -15,6 +15,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSByteOrder.h>
+#include <libkern/c++/OSData.h>
 
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxUAR, OSObject)
@@ -139,7 +140,11 @@ kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
     if (fBootIndex == 0 && fUarPool->getCount() == 0)
         fBootIndex = index;
     /* Pool record (MVP: record the virtual address for reuse) */
-    fUarPool->setObject(OSData::withBytes(uar, sizeof(MlxUarAlloc)));
+    OSData *record = OSData::withBytes(uar, sizeof(MlxUarAlloc));
+    if (record) {
+        fUarPool->setObject(record);
+        record->release();
+    }
 
     IOLog("MlxUAR: UAR[%u] allocated phys=0x%llx map=%p\n",
           index, uar->phys, uar->map);

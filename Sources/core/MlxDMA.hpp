@@ -5,7 +5,7 @@
  *
  * RDMA DMA integration core: hardware DMA needs physical addresses while
  * user space only has virtual addresses. This class pins user buffers with
- * IOMemoryDescriptor::withTask and obtains the list of physical segments.
+ * IOMemoryDescriptor::withAddressRange and obtains the physical segments.
  */
 #ifndef MLX_DMA_HPP
 #define MLX_DMA_HPP

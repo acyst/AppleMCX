@@ -17,6 +17,7 @@
 #define MLX_EVENT_TYPE_MAX      64
 #define MLX_NUM_ASYNC_EQS       3       /* cmd/async/pages */
 #define MLX_NUM_SPARE_EQE       128     /* number of spare EQEs (See eq.h:35) */
+#define MLX_MAX_EVENT_NOTIFIERS 4
 
 class MlxPCIDriver;
 
@@ -118,7 +119,8 @@ private:
     uint32_t        fNumAsyncEqs;
     MlxEqEntry     *fCompEqs;      /* N completion EQs */
     uint32_t        fNumCompEqs;
-    OSArray        *fNotifiers[MLX_EVENT_TYPE_MAX];
+    MlxEventNotifier *fNotifiers[MLX_EVENT_TYPE_MAX][MLX_MAX_EVENT_NOTIFIERS];
+    uint32_t        fNotifierCounts[MLX_EVENT_TYPE_MAX];
     IOLock         *fNotifierLock;
     IOWorkLoop     *fWorkLoop;
     IOInterruptEventSource *fAsyncIS;

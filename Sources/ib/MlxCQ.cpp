@@ -10,6 +10,7 @@
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
 #include "MlxEQ.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -125,9 +126,25 @@ kern_return_t MlxCQ::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
         return kr;
     }
 
+    OSData *record = OSData::withBytesNoCopy(cq, sizeof(*cq));
+    if (!record) {
+        cmdDestroyCQ(cq->cqNumber);
+        bufDesc->complete();
+        bufDesc->release();
+        IOFree(cq, sizeof(MlxCQContext));
+        return kIOReturnNoMemory;
+    }
     IOLockLock(fLock);
-    fCqTable->setObject(cq);
+    bool added = fCqTable->setObject(record);
     IOLockUnlock(fLock);
+    record->release();
+    if (!added) {
+        cmdDestroyCQ(cq->cqNumber);
+        bufDesc->complete();
+        bufDesc->release();
+        IOFree(cq, sizeof(MlxCQContext));
+        return kIOReturnNoMemory;
+    }
     *cqHandle = cq->cqNumber;
 
     IOLog("MlxCQ: CQ[%u] created log_size=%u eqn=%u cqe_dma=0x%llx\n",
@@ -141,7 +158,8 @@ kern_return_t MlxCQ::destroyCQ(uint32_t cqHandle)
     if (kr == kIOReturnSuccess) {
         IOLockLock(fLock);
         for (uint32_t i = 0; i < fCqTable->getCount(); i++) {
-            MlxCQContext *ctx = (MlxCQContext *)fCqTable->getObject(i);
+            MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+                fCqTable->getObject(i));
             if (ctx && ctx->cqNumber == cqHandle) {
                 /* Release the CQE buffer */
                 if (ctx->cqeBufDesc) {
@@ -163,7 +181,8 @@ MlxCQContext *MlxCQ::lookup(uint32_t cqHandle)
     MlxCQContext *found = NULL;
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fCqTable->getCount(); i++) {
-        MlxCQContext *ctx = (MlxCQContext *)fCqTable->getObject(i);
+        MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+            fCqTable->getObject(i));
         if (ctx && ctx->cqNumber == cqHandle) {
             found = ctx;
             break;

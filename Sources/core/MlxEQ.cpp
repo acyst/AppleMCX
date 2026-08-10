@@ -57,8 +57,8 @@ bool MlxEQ::init(MlxPCIDriver *owner, uint32_t numCompVectors)
     if (!fAsyncEqs || !fCompEqs || !fNotifierLock)
         return false;
 
-    for (int i = 0; i < MLX_EVENT_TYPE_MAX; i++)
-        fNotifiers[i] = OSArray::withCapacity(4);
+    memset(fNotifiers, 0, sizeof(fNotifiers));
+    memset(fNotifierCounts, 0, sizeof(fNotifierCounts));
 
     fWorkLoop = IOWorkLoop::workLoop();
     if (!fWorkLoop)
@@ -225,8 +225,17 @@ void MlxEQ::registerNotifier(uint32_t eventType, MlxEventNotifier *n)
     if (eventType >= MLX_EVENT_TYPE_MAX)
         return;
     IOLockLock(fNotifierLock);
-    if (fNotifiers[eventType] && !fNotifiers[eventType]->containsObject(n))
-        fNotifiers[eventType]->setObject(n);
+    uint32_t count = fNotifierCounts[eventType];
+    for (uint32_t i = 0; i < count; i++) {
+        if (fNotifiers[eventType][i] == n) {
+            IOLockUnlock(fNotifierLock);
+            return;
+        }
+    }
+    if (count < MLX_MAX_EVENT_NOTIFIERS) {
+        fNotifiers[eventType][count] = n;
+        fNotifierCounts[eventType] = count + 1;
+    }
     IOLockUnlock(fNotifierLock);
 }
 
@@ -235,8 +244,16 @@ void MlxEQ::unregisterNotifier(uint32_t eventType, MlxEventNotifier *n)
     if (eventType >= MLX_EVENT_TYPE_MAX)
         return;
     IOLockLock(fNotifierLock);
-    if (fNotifiers[eventType])
-        fNotifiers[eventType]->removeObject(n);
+    uint32_t count = fNotifierCounts[eventType];
+    for (uint32_t i = 0; i < count; i++) {
+        if (fNotifiers[eventType][i] != n)
+            continue;
+        for (uint32_t j = i + 1; j < count; j++)
+            fNotifiers[eventType][j - 1] = fNotifiers[eventType][j];
+        fNotifiers[eventType][count - 1] = NULL;
+        fNotifierCounts[eventType] = count - 1;
+        break;
+    }
     IOLockUnlock(fNotifierLock);
 }
 
@@ -274,13 +291,12 @@ void MlxEQ::handleAsyncEqe(uint32_t eqIdx)
         /* Dispatch to the notifier list (replaces atomic_notifier_call_chain) */
         uint32_t type = eqe->type;
         IOLockLock(fNotifierLock);
-        OSArray *list = (type < MLX_EVENT_TYPE_MAX) ? fNotifiers[type] : NULL;
-        if (list) {
-            for (uint32_t n = 0; n < list->getCount(); n++) {
-                MlxEventNotifier *nb = (MlxEventNotifier *)list->getObject(n);
-                if (nb)
-                    nb->handleEvent(type, eqe);
-            }
+        uint32_t count = (type < MLX_EVENT_TYPE_MAX) ?
+            fNotifierCounts[type] : 0;
+        for (uint32_t n = 0; n < count; n++) {
+            MlxEventNotifier *nb = fNotifiers[type][n];
+            if (nb)
+                nb->handleEvent(type, eqe);
         }
         IOLockUnlock(fNotifierLock);
         eq->consIndex++;
@@ -303,13 +319,12 @@ void MlxEQ::handleCompEqe(uint32_t eqIdx)
          * eqe->data.comp.cqn → CQ completion callback
          * MVP: dispatch to the COMPLETION notifier */
         IOLockLock(fNotifierLock);
-        OSArray *list = fNotifiers[MLX_EVENT_TYPE_COMPLETION];
-        if (list) {
-            for (uint32_t n = 0; n < list->getCount(); n++) {
-                MlxEventNotifier *nb = (MlxEventNotifier *)list->getObject(n);
-                if (nb)
-                    nb->handleEvent(MLX_EVENT_TYPE_COMPLETION, eqe);
-            }
+        uint32_t count = fNotifierCounts[MLX_EVENT_TYPE_COMPLETION];
+        for (uint32_t n = 0; n < count; n++) {
+            MlxEventNotifier *nb =
+                fNotifiers[MLX_EVENT_TYPE_COMPLETION][n];
+            if (nb)
+                nb->handleEvent(MLX_EVENT_TYPE_COMPLETION, eqe);
         }
         IOLockUnlock(fNotifierLock);
         eq->consIndex++;

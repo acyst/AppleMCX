@@ -8,6 +8,7 @@
  */
 #include "MlxDMA.hpp"
 #include "MlxPCIDriver.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -67,10 +68,9 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
     req->virtAddr = virtAddr;
     req->length = length;
 
-    /* pin user memory (See ib_umem_get)
-     * withTask(current_task, ...) binds to the calling user process */
-    IOMemoryDescriptor *mem = IOMemoryDescriptor::withTask(
-        current_task(), virtAddr, length, kIODirectionInOut, NULL);
+    /* Bind the virtual range to the calling user process. */
+    IOMemoryDescriptor *mem = IOMemoryDescriptor::withAddressRange(
+        virtAddr, length, kIODirectionInOut, current_task());
     if (!mem)
         return kIOReturnNoMemory;
 
@@ -123,9 +123,23 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
     req->numSegs = numSegs;
     req->memDesc = mem;   /* held until unpin */
 
+    OSData *record = OSData::withBytes(req, sizeof(*req));
+    if (!record) {
+        mem->complete();
+        mem->release();
+        req->memDesc = NULL;
+        return kIOReturnNoMemory;
+    }
     IOLockLock(fLock);
-    fPendingReqs->setObject(req);
+    bool added = fPendingReqs->setObject(record);
     IOLockUnlock(fLock);
+    record->release();
+    if (!added) {
+        mem->complete();
+        mem->release();
+        req->memDesc = NULL;
+        return kIOReturnNoMemory;
+    }
 
     IOLog("MlxDMA: pin 0x%llx len=%llu segs=%u pa0=0x%llx\n",
           virtAddr, length, numSegs, paList[0]);
@@ -138,7 +152,9 @@ void MlxDMA::unpinMemory(MlxDMAReq *req)
         return;
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fPendingReqs->getCount(); i++) {
-        if (fPendingReqs->getObject(i) == (OSObject *)req) {
+        MlxDMAReq *active = mlxRecordValue<MlxDMAReq>(
+            fPendingReqs->getObject(i));
+        if (active && active->memDesc == req->memDesc) {
             fPendingReqs->removeObject(i);
             break;
         }
@@ -159,7 +175,8 @@ uint64_t MlxDMA::lookupPhys(uint64_t virtAddr)
     uint64_t phys = 0;
     IOLockLock(fLock);
     for (uint32_t i = 0; i < fPendingReqs->getCount(); i++) {
-        MlxDMAReq *req = (MlxDMAReq *)fPendingReqs->getObject(i);
+        MlxDMAReq *req = mlxRecordValue<MlxDMAReq>(
+            fPendingReqs->getObject(i));
         if (!req || virtAddr < req->virtAddr ||
             virtAddr >= req->virtAddr + req->length)
             continue;
