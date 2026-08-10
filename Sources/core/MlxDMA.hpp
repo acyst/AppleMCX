@@ -38,7 +38,7 @@ class MlxDMA : public OSObject {
     OSDeclareDefaultStructors(MlxDMA)
 
 public:
-    bool init();
+    virtual bool init() APPLE_KEXT_OVERRIDE;
     virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* pin user memory → physical segment list
