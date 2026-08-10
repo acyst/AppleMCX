@@ -485,7 +485,7 @@ kern_return_t MlxEQ::setupInterrupts()
     for (uint32_t i = 0; i < fNumCompEqs; i++) {
         fCompIS[i] = IOInterruptEventSource::interruptEventSource(
             this, &MlxEQ::compIntrHandler,
-            fOwner->getPCI(), i + 1);   /* vectors 1..N */
+            fOwner->getPCI(), (int)(i + 1));   /* vectors 1..N */
         if (fCompIS[i]) {
             if (fWorkLoop->addEventSource(fCompIS[i]) != kIOReturnSuccess)
                 return kIOReturnError;

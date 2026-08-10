@@ -8,6 +8,7 @@
 #define MLX_AH_HPP
 
 #include <libkern/OSTypes.h>
+#include <libkern/c++/OSContainers.h>
 #include "MlxWQE.hpp"
 #include "MlxUCIO.h"
 

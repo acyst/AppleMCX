@@ -8,6 +8,7 @@
 #define MLX_HEALTH_HPP
 
 #include <libkern/OSTypes.h>
+#include <libkern/c++/OSObject.h>
 #include "MlxRegs.hpp"
 
 class MlxPCIDriver;

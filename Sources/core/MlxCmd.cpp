@@ -167,7 +167,7 @@ bool MlxCmd::allocIdx(uint32_t *idx)
     bool found = false;
     IOSimpleLockLock(fAllocLock);
     if (fBitmask) {
-        uint32_t bit = __builtin_ctz(fBitmask);
+        uint32_t bit = (uint32_t)__builtin_ctz(fBitmask);
         fBitmask &= ~(1u << bit);
         *idx = bit;
         found = true;
@@ -434,7 +434,7 @@ void MlxCmd::handleCompletion(uint32_t vector)
 {
     /* Event mode: firmware sends a CMD EQE, vector = completion bitmap
      * See cmd.c:1660 mlx5_cmd_comp_handler */
-    uint32_t idx = __builtin_ctz(vector);
+    uint32_t idx = (uint32_t)__builtin_ctz(vector);
     if (idx >= MLX_MAX_COMMANDS)
         return;
     MlxCmdEnt *ent = fEntArr[idx];
