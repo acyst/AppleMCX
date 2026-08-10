@@ -8,9 +8,10 @@
 #define MLX_CMD_HPP
 
 #include <libkern/OSTypes.h>
-#include <libkern/OSAtomic.h>
 #include <IOKit/IOMemoryDescriptor.h>
-#include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOLocks.h>
+#include "MlxKernelCompat.hpp"
 #include "MlxRegs.hpp"
 #include "MlxWQE.hpp"
 
@@ -81,8 +82,8 @@ struct MlxCmdEnt {
     /* descriptor pointer (within command queue page) */
     MlxCmdLayout *lay;
     /* in/out mailbox (allocated for large commands) */
-    IOMemoryDescriptor *inMailboxDesc;
-    IOMemoryDescriptor *outMailboxDesc;
+    IOBufferMemoryDescriptor *inMailboxDesc;
+    IOBufferMemoryDescriptor *outMailboxDesc;
     void       *inMailbox;
     uint64_t    inMailboxDMA;
     void       *outMailbox;
@@ -126,11 +127,11 @@ private:
     void setMailboxSignature(MlxCmdMailbox *mb, size_t len);
 
     /* Memory barrier */
-    static void memoryBarrier() { OSMemoryBarrier(); }
+    static void memoryBarrier() { mlxMemoryBarrier(); }
 
     MlxPCIDriver    *fOwner;
     IOMemoryMap     *fBar0;
-    IOMemoryDescriptor *fCmdBufDesc;
+    IOBufferMemoryDescriptor *fCmdBufDesc;
     void            *fCmdBuf;       /* command queue page virtual address */
     uint64_t         fCmdDMA;       /* command queue DMA address */
     uint8_t          fLogSz;

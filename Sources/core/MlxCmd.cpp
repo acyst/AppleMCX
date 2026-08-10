@@ -10,15 +10,16 @@
  */
 #include "MlxCmd.hpp"
 #include "MlxPCIDriver.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <libkern/OSTypes.h>
 #include <libkern/OSByteOrder.h>
-#include <libkern/OSAtomic.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOKitDebug.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -53,8 +54,8 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
 
     /* 1. Validate command interface revision: high 16 bits of cmdif_rev_fw_sub
      *    == CMD_IF_REV(5), See cmd.c:2239-2245 */
-    uint32_t cmdifRevFw = IORead32(bar0,
-                                   offsetof(struct MlxInitSeg, cmdif_rev_fw_sub));
+    uint32_t cmdifRevFw = mlxMMIORead32BE(
+        bar0, offsetof(struct MlxInitSeg, cmdif_rev_fw_sub));
     fCmdifRev = (uint16_t)(cmdifRevFw >> 16);
     if (fCmdifRev != MLX_CMD_IF_REV) {
         IOLog("MlxCmd: command interface revision mismatch (firmware=%u, need=%u)\n",
@@ -64,8 +65,8 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
 
     /* 2. Read the command queue parameters declared by firmware (low 12 bits of
      *    iseg->cmdq_addr_l_sz), See cmd.c:2255-2269 */
-    uint32_t cmdqAddrLSz = IORead32(bar0,
-                                    offsetof(struct MlxInitSeg, cmdq_addr_l_sz));
+    uint32_t cmdqAddrLSz = mlxMMIORead32BE(
+        bar0, offsetof(struct MlxInitSeg, cmdq_addr_l_sz));
     fLogSz     = (uint8_t)(cmdqAddrLSz & 0x3F);
     fLogStride = (uint8_t)((cmdqAddrLSz >> 6) & 0x3F);
     uint32_t queueSize = 1u << fLogSz;
@@ -77,7 +78,7 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
     /* 3. Allocate a DMA-coherent command queue page
      *    See cmd.c:2188 alloc_cmd_page */
     fCmdBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut, cmdqSize, 0xFFFFFFF000ULL, 0);
+        kernel_task, kIODirectionInOut, cmdqSize, 0xFFFFFFF000ULL);
     if (!fCmdBufDesc) {
         IOLog("MlxCmd: command queue allocation failed\n");
         return false;
@@ -93,11 +94,10 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
 
     /* 4. Write the command queue DMA address to firmware
      *    See cmd.c:2300-2304 */
-    IOWrite32(bar0, offsetof(struct MlxInitSeg, cmdq_addr_h),
-              (uint32_t)(fCmdDMA >> 32));
-    IOWrite32(bar0, offsetof(struct MlxInitSeg, cmdq_addr_l_sz),
-              (uint32_t)(fCmdDMA & 0xFFFFFFFF));
-    OSMemoryBarrier();
+    mlxMMIOWrite32BE(bar0, offsetof(struct MlxInitSeg, cmdq_addr_h),
+                     (uint32_t)(fCmdDMA >> 32));
+    mlxMMIOWrite32BE(bar0, offsetof(struct MlxInitSeg, cmdq_addr_l_sz),
+                     (uint32_t)(fCmdDMA & 0xFFFFFFFF));
 
     /* 5. Initialize the command slot bitmap and locks */
     fMaxRegCmds = queueSize - 1;
@@ -161,7 +161,7 @@ kern_return_t MlxCmd::allocMailbox(MlxCmdEnt *ent, uint32_t inSize, uint32_t out
     if (inSize > 16) {
         ent->inMailboxDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, kIODirectionInOut, MLX_CMD_DATA_BLOCK_SIZE,
-            0xFFFFFFF000ULL, 0);
+            0xFFFFFFF000ULL);
         if (!ent->inMailboxDesc)
             return kIOReturnNoMemory;
         if (ent->inMailboxDesc->prepare(kIODirectionInOut) != kIOReturnSuccess)
@@ -174,7 +174,7 @@ kern_return_t MlxCmd::allocMailbox(MlxCmdEnt *ent, uint32_t inSize, uint32_t out
     if (outSize > 16) {
         ent->outMailboxDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, kIODirectionInOut, MLX_CMD_DATA_BLOCK_SIZE,
-            0xFFFFFFF000ULL, 0);
+            0xFFFFFFF000ULL);
         if (!ent->outMailboxDesc)
             return kIOReturnNoMemory;
         if (ent->outMailboxDesc->prepare(kIODirectionInOut) != kIOReturnSuccess)
@@ -255,8 +255,8 @@ kern_return_t MlxCmd::submit(uint32_t idx, MlxCmdInOut *cmd)
 
     /* Doorbell: set the command slot bit → firmware fetches the command via DMA
      * See cmd.c:1044-1047 */
-    OSMemoryBarrier();
-    IOWrite32(fBar0, offsetof(struct MlxInitSeg, cmd_dbell), (1u << idx));
+    mlxMemoryBarrier();
+    mlxMMIOWrite32BE(fBar0, offsetof(struct MlxInitSeg, cmd_dbell), 1u << idx);
 
     return kIOReturnSuccess;
 }
@@ -304,7 +304,7 @@ kern_return_t MlxCmd::exec(MlxCmdInOut *cmd, uint32_t timeoutMs)
                 break;
             deadline--;
         }
-        OSMemoryBarrier();
+        mlxMemoryBarrier();
         uint8_t own = ent.lay->status_own;
         if (!(own & MLX_CMD_OWNER_HW)) {
             ent.done = true;

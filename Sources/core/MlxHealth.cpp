@@ -8,6 +8,7 @@
  */
 #include "MlxHealth.hpp"
 #include "MlxPCIDriver.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -32,9 +33,9 @@ MlxHealthState MlxHealth::check()
 {
     /* Read iseg->health.hw_health_counter
      * See health.c: mlx5_health_check to check counter progress */
-    uint32_t counter = IORead32(fOwner->getBar0(),
-                                offsetof(struct MlxInitSeg, health) +
-                                offsetof(MlxInitSeg::MlxHealthBuffer, hw_health_counter));
+    uint32_t counter = mlxMMIORead32BE(
+        fOwner->getBar0(), offsetof(struct MlxInitSeg, health) +
+        offsetof(MlxInitSeg::MlxHealthBuffer, hw_health_counter));
 
     if (fStarted && counter == fLastCounter) {
         /* Counter unchanged → firmware may be hung (MVP: record only, full recovery P5) */
@@ -52,9 +53,9 @@ void MlxHealth::start(uint64_t intervalUs)
 {
     fIntervalUs = intervalUs;
     fStarted = true;
-    fLastCounter = IORead32(fOwner->getBar0(),
-                            offsetof(struct MlxInitSeg, health) +
-                            offsetof(MlxInitSeg::MlxHealthBuffer, hw_health_counter));
+    fLastCounter = mlxMMIORead32BE(
+        fOwner->getBar0(), offsetof(struct MlxInitSeg, health) +
+        offsetof(MlxInitSeg::MlxHealthBuffer, hw_health_counter));
     IOLog("MlxHealth: health polling started (interval=%llu us)\n", intervalUs);
     /* MVP: polling uses a timer; full implementation in late phase P1 */
 }

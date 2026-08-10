@@ -10,6 +10,7 @@
 #include "MlxEthernet.hpp"
 #include "MlxRoCE.hpp"
 #include "MlxPCIDriver.hpp"
+#include "MlxKernelCompat.hpp"
 #include "MlxCmd.hpp"
 #include "MlxDMA.hpp"
 #include "MlxRegs.hpp"
@@ -17,6 +18,7 @@
 #include <string.h>
 #include <sys/mbuf.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/network/IONetworkMedium.h>
 #include <libkern/OSByteOrder.h>
 
@@ -55,7 +57,7 @@ kern_return_t MlxEthRing::allocBuffers()
     /* Allocate a DMA-coherent WQ buffer + DB record (see mlx5_wq_alloc) */
     uint32_t wqBytes = fSize * fWqebbSize;
     fWqDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut, wqBytes, 0xFFFFFFF000ULL, 0);
+        kernel_task, kIODirectionInOut, wqBytes, 0xFFFFFFF000ULL);
     if (!fWqDesc)
         return kIOReturnNoMemory;
     if (fWqDesc->prepare(kIODirectionInOut) != kIOReturnSuccess) {
@@ -84,7 +86,7 @@ void MlxEthRing::updateDb(uint16_t head)
     fHead = head;
     if (fDbRecord)
         *fDbRecord = head;
-    OSMemoryBarrier();
+    mlxMemoryBarrier();
     /* The doorbell write (BF) is done in the xmit path */
 }
 
@@ -338,7 +340,7 @@ kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
     wqe->data[0].addr = OSSwapHostToBigInt64(phys ? phys
                                                   : (uint64_t)(uintptr_t)data);
 
-    OSMemoryBarrier();
+    mlxMemoryBarrier();
 
     /* Update the DB record + doorbell (see the doorbell write in mlx5e_sq_xmit_wqe) */
     fTxRing->setHead(head + 1);

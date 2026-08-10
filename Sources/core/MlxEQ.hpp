@@ -11,6 +11,7 @@
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include "MlxRegs.hpp"
 
 #define MLX_EVENT_TYPE_MAX      64
@@ -56,7 +57,7 @@ struct MlxEqEntry {
     uint32_t     eqNumber;
     uint32_t     doorbellOffset; /* UAR + MLX_EQ_DOORBELL */
     uint32_t     irqVector;
-    IOMemoryDescriptor *fDesc;  /* ring buffer memory descriptor */
+    IOBufferMemoryDescriptor *fDesc;  /* ring buffer memory descriptor */
     uint32_t     eventMask[4];  /* event mask (128-bit) */
 };
 

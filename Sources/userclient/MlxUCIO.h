@@ -151,7 +151,7 @@ struct mlx_fw_cmd_resp {
 struct mlx_fw_ver_resp {
     uint32_t  fwRev;           /* version number (encoded) */
     uint32_t  cmdifRev;
-    uint8_t   deviceId;
+    uint16_t  deviceId;
     uint8_t   portType;
     uint32_t  numPorts;
 };

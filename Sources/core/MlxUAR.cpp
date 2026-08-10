@@ -13,6 +13,7 @@
 #include <string.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSByteOrder.h>
 
 #define super OSObject
@@ -27,6 +28,7 @@ bool MlxUAR::init(MlxPCIDriver *owner)
     fUarPool = OSArray::withCapacity(4);
     fUarBitmap = 0;
     fUarMemDesc = NULL;
+    fUarMap = NULL;
     fBootIndex = 0;
     fDbRecord = NULL;
     fDbRecordDMA = 0;
@@ -40,7 +42,7 @@ kern_return_t MlxUAR::allocDbRecord()
      * See mlx5_db_alloc (driver.h:1006 struct mlx5_db)
      * Layout: db[0]=RQ DB, db[1]=SQ DB (See mlx5_db_type) */
     fDbMemDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut, 4096, 0xFFFFFFF000ULL, 0);
+        kernel_task, kIODirectionInOut, 4096, 0xFFFFFFF000ULL);
     if (!fDbMemDesc)
         return kIOReturnNoMemory;
     if (fDbMemDesc->prepare(kIODirectionInOut) != kIOReturnSuccess) {
@@ -121,8 +123,9 @@ kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
         IOMemoryMap *map = desc->createMappingInTask(
             kernel_task, 0, kIOMapAnywhere, 0, 4096);
         if (map) {
-            uar->map = (void *)map->getVirtualAddress();
-            map->release();
+            uar->map = reinterpret_cast<void *>(
+                static_cast<uintptr_t>(map->getVirtualAddress()));
+            fUarMap = map;       /* keep the kernel mapping alive */
             fUarMemDesc = desc;   /* keep for user-space mapping */
         } else {
             desc->release();
@@ -146,6 +149,10 @@ kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
 void MlxUAR::freeUar(MlxUarAlloc *uar)
 {
     cmdFreeUar(uar->index);
+    if (fUarMap) {
+        fUarMap->release();
+        fUarMap = NULL;
+    }
     if (fUarMemDesc) {
         fUarMemDesc->release();
         fUarMemDesc = NULL;
@@ -164,8 +171,10 @@ kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
     fUarBitmap |= (1u << dbi);
 
     bfreg->offset = MLX_BF_OFFSET + (dbi << 12);
-    bfreg->map = (void *)((uintptr_t)fUarMemDesc->getBytesNoCopy() +
-                          (uintptr_t)bfreg->offset);
+    if (!fUarMap)
+        return kIOReturnNotReady;
+    bfreg->map = reinterpret_cast<void *>(
+        static_cast<uintptr_t>(fUarMap->getVirtualAddress()) + bfreg->offset);
     IOLog("MlxUAR: BF allocated dbi=%u offset=0x%x\n", dbi, bfreg->offset);
     return kIOReturnSuccess;
 }

@@ -14,6 +14,7 @@
 #include <IOKit/network/IOEthernetInterface.h>
 #include <IOKit/network/IONetworkStack.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <sys/mbuf.h>
 #include "MlxWQE.hpp"
 #include "MlxUCIO.h"
@@ -141,7 +142,7 @@ private:
     uint16_t    fTail;
     void       *fWqBuf;
     uint64_t    fWqDMA;
-    IOMemoryDescriptor *fWqDesc;   /* WQ buffer descriptor */
+    IOBufferMemoryDescriptor *fWqDesc;   /* WQ buffer descriptor */
     uint32_t   *fDbRecord;    /* doorbell record */
     uint64_t    fDbDMA;
 };

@@ -16,6 +16,7 @@
 #include "MlxHealth.hpp"
 #include "MlxDMA.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -386,8 +387,8 @@ IOReturn MlxUserClient::sQueryFwVer(OSObject *t, void *ref,
     if (!resp)
         return kIOReturnBadArgument;
     memset(resp, 0, sizeof(*resp));
-    uint32_t fwRev = IORead32(self->fCore->getBar0(),
-                              offsetof(struct MlxInitSeg, fw_rev));
+    uint32_t fwRev = mlxMMIORead32BE(
+        self->fCore->getBar0(), offsetof(struct MlxInitSeg, fw_rev));
     resp->fwRev = fwRev;
     resp->cmdifRev = self->fCore->getCmd()->cmdifRev();
     if (self->fCore->getHCA()) {

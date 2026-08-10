@@ -9,6 +9,7 @@
 
 #include <libkern/OSTypes.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include "MlxWQE.hpp"
 #include "MlxEQ.hpp"
 
@@ -24,7 +25,7 @@ struct MlxCQContext {
     /* CQE buffer (kernel DMA allocation) */
     uint64_t    cqeBufAddr;     /* virtual address */
     uint64_t    cqeDMA;         /* physical address */
-    IOMemoryDescriptor *cqeBufDesc;  /* buffer descriptor (held) */
+    IOBufferMemoryDescriptor *cqeBufDesc;  /* buffer descriptor (held) */
     uint32_t    dbRecordOffset;
     uint32_t    eqNumber;
     uint32_t    compVector;

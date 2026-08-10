@@ -13,6 +13,7 @@
 
 #include <string.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSByteOrder.h>
 
 #define super OSObject
@@ -99,7 +100,7 @@ kern_return_t MlxCQ::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
     uint32_t cqBytes = (1u << cq->logSize) * cq->cqeSize;
     IOBufferMemoryDescriptor *bufDesc =
         IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-            kernel_task, kIODirectionInOut, cqBytes, 0xFFFFFFF000ULL, 0);
+            kernel_task, kIODirectionInOut, cqBytes, 0xFFFFFFF000ULL);
     if (!bufDesc) {
         IOFree(cq, sizeof(MlxCQContext));
         return kIOReturnNoMemory;

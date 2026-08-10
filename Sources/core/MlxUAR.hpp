@@ -11,6 +11,7 @@
 
 #include <libkern/OSTypes.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include "MlxRegs.hpp"
 
 class MlxPCIDriver;
@@ -75,11 +76,12 @@ private:
     MlxPCIDriver *fOwner;
     OSArray     *fUarPool;       /* pool of allocated UARs */
     IOMemoryDescriptor *fUarMemDesc;
+    IOMemoryMap        *fUarMap;
     uint32_t    fUarBitmap;      /* BF allocation bitmap */
     uint32_t    fBootIndex;      /* boot UAR index */
     uint32_t   *fDbRecord;       /* DB record page */
     uint64_t    fDbRecordDMA;
-    IOMemoryDescriptor *fDbMemDesc;
+    IOBufferMemoryDescriptor *fDbMemDesc;
 };
 
 #endif /* MLX_UAR_HPP */

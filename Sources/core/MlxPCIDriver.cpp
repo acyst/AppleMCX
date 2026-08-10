@@ -13,6 +13,7 @@
 #include "MlxEQ.hpp"
 #include "MlxUAR.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <stdio.h>
 #include <IOKit/IOLib.h>
@@ -171,7 +172,7 @@ bool MlxPCIDriver::start(IOService *provider)
     registerService();
 
     IOLog("MlxPCIDriver: device ready (device=0x%04x, fw_rev=%08x)\n",
-          fDeviceId, IORead32(fBar0Map, offsetof(struct MlxInitSeg, fw_rev)));
+           fDeviceId, mlxMMIORead32BE(fBar0Map, offsetof(struct MlxInitSeg, fw_rev)));
     return true;
 }
 
@@ -220,8 +221,8 @@ bool MlxPCIDriver::fwInit()
 {
     /* 1. Wait for firmware to leave pre-init (See wait_fw_init, main.c:281-307) */
     for (int i = 0; i < 100; i++) {
-        uint32_t init = IORead32(fBar0Map,
-                                 offsetof(struct MlxInitSeg, initializing));
+        uint32_t init = mlxMMIORead32BE(
+            fBar0Map, offsetof(struct MlxInitSeg, initializing));
         if (!(init & (1u << 31)))
             break;
         IOSleep(10);

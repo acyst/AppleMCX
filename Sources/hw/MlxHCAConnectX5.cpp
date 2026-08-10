@@ -11,6 +11,7 @@
 #include "MlxPCIDriver.hpp"
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 #include "MlxUAR.hpp"
 
 #include <IOKit/IOLib.h>
@@ -39,12 +40,12 @@ public:
 
     virtual uint32_t readReg(void *mmioOffset) APPLE_KEXT_OVERRIDE
     {
-        return IORead32(fCore->getBar0(), (uintptr_t)mmioOffset);
+        return mlxMMIORead32BE(fCore->getBar0(), (uintptr_t)mmioOffset);
     }
 
     virtual void writeReg(void *mmioOffset, uint32_t value) APPLE_KEXT_OVERRIDE
     {
-        IOWrite32(fCore->getBar0(), (uintptr_t)mmioOffset, value);
+        mlxMMIOWrite32BE(fCore->getBar0(), (uintptr_t)mmioOffset, value);
     }
 
     virtual void *getUarVirtual() APPLE_KEXT_OVERRIDE

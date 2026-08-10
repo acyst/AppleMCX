@@ -12,11 +12,13 @@
 #include "MlxPCIDriver.hpp"
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
+#include "MlxKernelCompat.hpp"
 
 #include <string.h>
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSByteOrder.h>
 
 #define super OSObject
@@ -33,7 +35,7 @@ init_eq_buf(MlxEqEntry *eq)
         MlxEqe *eqe = (MlxEqe *)(buf + (i * 32));
         eqe->owner = 1;
     }
-    OSMemoryBarrier();
+    mlxMemoryBarrier();
 }
 
 bool MlxEQ::init(MlxPCIDriver *owner, uint32_t numCompVectors)
@@ -72,7 +74,7 @@ kern_return_t MlxEQ::allocEqBuf(MlxEqEntry *eq)
     sizeBytes *= 32;
 
     eq->fDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
-        kernel_task, kIODirectionInOut, sizeBytes, 0xFFFFFFF000ULL, 0);
+        kernel_task, kIODirectionInOut, sizeBytes, 0xFFFFFFF000ULL);
     if (!eq->fDesc)
         return kIOReturnNoMemory;
     if (eq->fDesc->prepare(kIODirectionInOut) != kIOReturnSuccess)
@@ -268,7 +270,7 @@ void MlxEQ::handleAsyncEqe(uint32_t eqIdx)
         MlxEqe *eqe = (MlxEqe *)(buf + ((eq->consIndex & (size - 1)) * 32));
         if (!isNewEqe(eq, eqe))
             break;
-        OSMemoryBarrier();
+        mlxMemoryBarrier();
         /* Dispatch to the notifier list (replaces atomic_notifier_call_chain) */
         uint32_t type = eqe->type;
         IOLockLock(fNotifierLock);
@@ -296,7 +298,7 @@ void MlxEQ::handleCompEqe(uint32_t eqIdx)
         MlxEqe *eqe = (MlxEqe *)(buf + ((eq->consIndex & (size - 1)) * 32));
         if (!isNewEqe(eq, eqe))
             break;
-        OSMemoryBarrier();
+        mlxMemoryBarrier();
         /* CQ completion event (See mlx5_eq_comp_int, eq.c:106)
          * eqe->data.comp.cqn → CQ completion callback
          * MVP: dispatch to the COMPLETION notifier */
