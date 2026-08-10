@@ -13,6 +13,7 @@
 
 #include <stdint.h>
 #include <libkern/OSTypes.h>
+#include <mach/kern_return.h>
 #include "MlxRegs.hpp"
 #include "MlxUCIO.h"   /* MLX_LINK_LAYER_* constants */
 

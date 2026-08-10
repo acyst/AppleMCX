@@ -9,6 +9,7 @@
 
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSObject.h>
+#include <mach/kern_return.h>
 #include "MlxRegs.hpp"
 #include "MlxUCIO.h"
 

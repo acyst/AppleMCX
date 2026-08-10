@@ -9,6 +9,7 @@
 
 #include <libkern/OSTypes.h>
 #include <libkern/c++/OSContainers.h>
+#include <mach/kern_return.h>
 #include "MlxWQE.hpp"
 #include "MlxUCIO.h"
 
