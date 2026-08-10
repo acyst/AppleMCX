@@ -26,7 +26,10 @@ COMMON_INC := -ISources -ISources/hw -ISources/core -ISources/ib \
               -ISources/userclient -ISources/netif
 
 KERNEL_INC := \
+    -isysroot $(SDK) \
+    -isystem $(SDK)/usr/include \
     -I$(SDK)/System/Library/Frameworks/Kernel.framework/Headers \
+    -I$(SDK)/System/Library/Frameworks/Kernel.framework/PrivateHeaders \
     -I$(SDK)/System/Library/Frameworks/IOKit.framework/Headers
 
 CFLAGS := -Wall -Wextra -Wno-unused-parameter -std=c++17 \
