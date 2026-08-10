@@ -8,6 +8,7 @@
 #define MLX_CQ_HPP
 
 #include <libkern/OSTypes.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include "MlxWQE.hpp"

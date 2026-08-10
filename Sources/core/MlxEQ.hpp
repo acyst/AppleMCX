@@ -8,6 +8,7 @@
 #define MLX_EQ_HPP
 
 #include <libkern/OSTypes.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOMemoryDescriptor.h>

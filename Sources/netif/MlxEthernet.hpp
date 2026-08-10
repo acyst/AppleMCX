@@ -12,7 +12,6 @@
 
 #include <IOKit/network/IOEthernetController.h>
 #include <IOKit/network/IOEthernetInterface.h>
-#include <IOKit/network/IONetworkStack.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>
@@ -32,7 +31,7 @@ class MlxEthernet : public IOEthernetController {
 
 public:
     /* IOService lifecycle */
-    virtual bool init() APPLE_KEXT_OVERRIDE;
+    virtual bool init(OSDictionary *properties = NULL) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void free() APPLE_KEXT_OVERRIDE;
@@ -40,13 +39,14 @@ public:
     /* IOEthernetController */
     virtual IOReturn enable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
     virtual IOReturn disable(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
-    virtual IOReturn setPromiscuousMode(IOBoolean active) APPLE_KEXT_OVERRIDE;
-    virtual IOReturn setMulticastMode(IOBoolean active) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setPromiscuousMode(bool active) APPLE_KEXT_OVERRIDE;
+    virtual IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
     virtual UInt32 outputPacket(mbuf_t packet, void *param) APPLE_KEXT_OVERRIDE;
     virtual IOReturn getPacketFilters(const OSSymbol *group,
                                       UInt32 *filters) const APPLE_KEXT_OVERRIDE;
     virtual IOReturn getMaxPacketSize(UInt32 *maxSize) const APPLE_KEXT_OVERRIDE;
     virtual IOReturn getMinPacketSize(UInt32 *minSize) const APPLE_KEXT_OVERRIDE;
+    virtual IOReturn getHardwareAddress(IOEthernetAddress *addrP) APPLE_KEXT_OVERRIDE;
     virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 
     /* RX path: called by the EQ completion interrupt after the hardware receives a packet */
@@ -59,10 +59,6 @@ public:
     MlxPCIDriver *getCore() { return fCore; }
 
 private:
-    /* Create/destroy the Ethernet interface */
-    bool createInterface();
-    void destroyInterface();
-
     /* TX: build a WQE and write it to the SQ (see mlx5e_xmit, en_tx.c:666) */
     kern_return_t xmitPacket(mbuf_t packet);
     kern_return_t xmitInline(mbuf_t packet);

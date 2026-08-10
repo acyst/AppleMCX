@@ -20,6 +20,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/network/IONetworkMedium.h>
+#include <IOKit/network/IOOutputQueue.h>
 #include <libkern/OSByteOrder.h>
 
 #define super IOEthernetController
@@ -95,9 +96,9 @@ void MlxEthRing::updateDb(uint16_t head)
 
 /* ========== MlxEthernet ========== */
 
-bool MlxEthernet::init()
+bool MlxEthernet::init(OSDictionary *properties)
 {
-    if (!super::init())
+    if (!super::init(properties))
         return false;
 
     fCore = NULL;
@@ -153,11 +154,12 @@ bool MlxEthernet::start(IOService *provider)
     uint8_t mac[6] = {0x00, 0x02, 0xC9, 0x00, 0x00, 0x01};
     memcpy(fMacAddr, mac, 6);
 
-    /* Create the Ethernet interface */
-    if (!createInterface()) {
+    /* Create and attach the Ethernet interface to the kernel protocol stack */
+    if (!attachInterface(&fNic, true)) {
         IOLog("MlxEthernet: interface creation failed\n");
         return false;
     }
+    fNetif = OSDynamicCast(IOEthernetInterface, fNic);
 
     IOLog("MlxEthernet: interface ready MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -166,7 +168,12 @@ bool MlxEthernet::start(IOService *provider)
 
 void MlxEthernet::stop(IOService *provider)
 {
-    destroyInterface();
+    if (fNic) {
+        detachInterface(fNic, true);
+        fNic->release();
+        fNic = NULL;
+        fNetif = NULL;
+    }
     if (fTxRing) {
         fTxRing->release();
         fTxRing = NULL;
@@ -191,34 +198,12 @@ void MlxEthernet::free()
     super::free();
 }
 
-bool MlxEthernet::createInterface()
+IOReturn MlxEthernet::getHardwareAddress(IOEthernetAddress *addrP)
 {
-    /* Create and register an IOEthernetInterface */
-    fNic = IOEthernetInterface::withController(this);
-    if (!fNic)
-        return false;
-
-    /* Set the MAC address */
-    fNic->setHardwareAddress(fMacAddr, 6);
-
-    IOReturn kr = fNic->registerInterface();
-    if (kr != kIOReturnSuccess) {
-        fNic->release();
-        fNic = NULL;
-        return false;
-    }
-    fNetif = OSDynamicCast(IOEthernetInterface, fNic);
-    return true;
-}
-
-void MlxEthernet::destroyInterface()
-{
-    if (fNic) {
-        fNic->unregisterInterface();
-        fNic->release();
-        fNic = NULL;
-        fNetif = NULL;
-    }
+    if (!addrP)
+        return kIOReturnBadArgument;
+    memcpy(addrP->bytes, fMacAddr, kIOEthernetAddressSize);
+    return kIOReturnSuccess;
 }
 
 IOReturn MlxEthernet::enable(IONetworkInterface *netif)
@@ -236,12 +221,12 @@ IOReturn MlxEthernet::disable(IONetworkInterface *netif)
     return kIOReturnSuccess;
 }
 
-IOReturn MlxEthernet::setPromiscuousMode(IOBoolean active)
+IOReturn MlxEthernet::setPromiscuousMode(bool active)
 {
     return kIOReturnSuccess;
 }
 
-IOReturn MlxEthernet::setMulticastMode(IOBoolean active)
+IOReturn MlxEthernet::setMulticastMode(bool active)
 {
     return kIOReturnSuccess;
 }
@@ -380,7 +365,7 @@ kern_return_t MlxEthernet::receivePacket(mbuf_t packet, UInt32 length)
     }
     /* See Linux netif_receive_skb → macOS: fNic->inputPacket */
     if (fNic)
-        fNic->inputPacket(packet, length, kIOInputPacketOptionsLoopback);
+        fNic->inputPacket(packet, length, 0);
     else
         mbuf_freem(packet);
     return kIOReturnSuccess;
@@ -394,10 +379,8 @@ void MlxEthernet::setLinkState(bool up, UInt32 speedMbps)
     IOLockUnlock(fLock);
 
     /* Report to the kernel */
-    if (fNic) {
-        fNic->setLinkState(up);
-        fNic->setLinkSpeed(speedMbps);
-    }
+    setLinkStatus(up ? (kIONetworkLinkValid | kIONetworkLinkActive) : 0,
+                  NULL, (UInt64)speedMbps * 1000000ULL);
     IOLog("MlxEthernet: link %s (%u Mbps)\n",
           up ? "UP" : "DOWN", speedMbps);
 }

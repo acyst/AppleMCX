@@ -204,7 +204,7 @@ IOReturn MlxUserClient::clientMemoryForType(UInt32 type,
                 fRoce->getCQ()->getCqMemDesc(fActiveCq);
             if (desc) {
                 *memory = desc;
-                *options = kIOMapReadOnly | kIOMapWriteOnly;
+                *options = 0;
                 return kIOReturnSuccess;
             }
         }

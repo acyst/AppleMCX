@@ -8,6 +8,7 @@
 #define MLX_QP_HPP
 
 #include <libkern/OSTypes.h>
+#include <IOKit/IOLocks.h>
 #include "MlxRegs.hpp"
 #include "MlxWQE.hpp"
 #include "MlxDMA.hpp"

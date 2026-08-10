@@ -10,6 +10,7 @@
 #define MLX_UAR_HPP
 
 #include <libkern/OSTypes.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>

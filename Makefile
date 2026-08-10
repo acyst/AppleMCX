@@ -43,7 +43,11 @@ CFLAGS := -Wall -Wextra -Wno-unused-parameter -std=c++17 \
     -Os
 
 # KEXT 链接: 内核态, 无标准库, 用 cctools ld64 的 -kext 模式
-LDFLAGS := -arch $(ARCH) -nostdlib -Wl,-kext -lcc_kext -lcplusplus
+# 优先 KPI stub (libcc_kext/libcplusplus); macOS 26+ SDK 已移除该 stub,
+# 改用 -undefined dynamic_lookup, 由内核加载器 kxld 在加载时解析导出符号
+KEXT_STUB := $(wildcard $(SDK)/System/Library/Frameworks/Kernel.framework/Libraries/libcc_kext.tbd)
+LDFLAGS := -arch $(ARCH) -nostdlib -Wl,-kext \
+    $(if $(KEXT_STUB),-lcc_kext -lcplusplus,-undefined dynamic_lookup)
 
 # ---- 目标 ----
 .PHONY: all clean load unload sign deploy status tools

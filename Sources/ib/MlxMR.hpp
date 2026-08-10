@@ -8,6 +8,7 @@
 #define MLX_MR_HPP
 
 #include <libkern/OSTypes.h>
+#include <IOKit/IOLocks.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IODMACommand.h>
 #include "MlxUCIO.h"

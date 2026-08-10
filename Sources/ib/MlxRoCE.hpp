@@ -9,6 +9,7 @@
 
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOLocks.h>
 #include "MlxHCA.hpp"
 #include "MlxWQE.hpp"
 #include "MlxEQ.hpp"
