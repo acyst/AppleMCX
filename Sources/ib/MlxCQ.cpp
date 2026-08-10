@@ -20,6 +20,41 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxCQ, OSObject)
 
+void MlxCQ::free()
+{
+    if (fCqTable) {
+        while (fCqTable->getCount()) {
+            MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+                fCqTable->getObject(0));
+            if (ctx) {
+                uint32_t cqn = ctx->cqNumber;
+                if (fRoce && fRoce->getCore() &&
+                    fRoce->getCore()->getCmd() &&
+                    fRoce->getCore()->getCmd()->isUp()) {
+                    if (destroyCQ(cqn) == kIOReturnSuccess)
+                        continue;
+                }
+                if (ctx->cqeDmaMap)
+                    mlxUnmapDMA(ctx->cqeDmaMap);
+                if (ctx->cqeBufDesc)
+                    ctx->cqeBufDesc->release();
+                if (fRoce && fRoce->getCore() && fRoce->getCore()->getUAR())
+                    fRoce->getCore()->getUAR()->freeDbSlots(
+                        ctx->dbRecordOffset, 2);
+                IOFree(ctx, sizeof(*ctx));
+            }
+            fCqTable->removeObject(static_cast<unsigned int>(0));
+        }
+        fCqTable->release();
+        fCqTable = NULL;
+    }
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = NULL;
+    }
+    super::free();
+}
+
 bool MlxCQ::init(MlxRoCE *roce)
 {
     if (!super::init())
@@ -27,48 +62,40 @@ bool MlxCQ::init(MlxRoCE *roce)
     fRoce = roce;
     fCqTable = OSArray::withCapacity(32);
     fLock = IOLockAlloc();
-    return true;
+    return fCqTable && fLock;
 }
 
 kern_return_t MlxCQ::cmdCreateCQ(MlxCQContext *cq, uint32_t eqNumber)
 {
-    /* See create_cq_user (cq.c:717)
-     * create_cq_in = 64B header + cqc(128B) + event_bitmask(128B) + pas */
+    /* mlx5 IFC create_cq_in: CQC starts at bit 0x80 and PAS at bit 0x880. */
     uint8_t in[4096] = {};
     uint8_t out[64] = {};
-    uint32_t cqcOff = 0x40;
-    uint32_t maskOff = cqcOff + 128;
-    uint32_t pasOff = maskOff + 128;
+    uint32_t cqcOff = 0x80 / 8;
+    uint32_t pasOff = 0x880 / 8;
 
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_CQ);
 
-    /* cqc (see mlx5_ifc.h cqc_bits):
-     *   cqe_sz(4bit) at +0x08, log_cq_size(5bit) at +0x20+3,
-     *   uar_page(24bit) at +0x30, eqn(24bit) at +0x40, log_page_size at +0x80 */
     uint8_t *cqc = in + cqcOff;
-    cqc[0x08] = 0x0;                            /* cqe_sz = 0 (64B) */
-    cqc[0x20] = (uint8_t)((cq->logSize << 3) & 0xF8);   /* log_cq_size */
-    cqc[0x30] = 0;                              /* uar_page = 0 */
-    cqc[0x40] = (uint8_t)((eqNumber >> 16) & 0xFF);
-    cqc[0x41] = (uint8_t)((eqNumber >> 8) & 0xFF);
-    cqc[0x42] = (uint8_t)(eqNumber & 0xFF);
+    mlxSetBits(cqc, 0x08, 3, 0); /* 64-byte CQE */
+    mlxSetBits(cqc, 0x63, 5, cq->logSize);
+    mlxSetBits(cqc, 0x68, 24,
+               fRoce->getCore()->getUAR()->getBootUarIndex());
+    mlxSetBits(cqc, 0xa0, 32, eqNumber);
+    mlxSetBits(cqc, 0xc3, 5, 0); /* 4 KiB pages */
+    mlxSetBits(cqc, 0x1c0, 64,
+               fRoce->getCore()->getUAR()->getDbRecordDMA() +
+                   cq->dbRecordOffset);
+    for (uint32_t i = 0; i < cq->numPages; i++)
+        OSWriteBigInt64(in, pasOff + i * 8, cq->pageDMA[i]);
 
-    /* event mask: completion events */
-    OSWriteBigInt32(in, maskOff, 1u << MLX_EVENT_TYPE_COMPLETION);
-
-    /* PAS */
-    OSWriteBigInt64(in, pasOff, cq->cqeDMA);
-
-    uint32_t inSize = pasOff + 8;
-    MlxCmdInOut cmd = { in, inSize, out, sizeof(out), MLX_CMD_OP_CREATE_CQ };
+    uint32_t inSize = pasOff + cq->numPages * 8;
     kern_return_t kr = fRoce->getCore()->exec(MLX_CMD_OP_CREATE_CQ,
-                                              in, inSize,
-                                              out, sizeof(out), 5000);
+                                              in, inSize, out, sizeof(out),
+                                              5000);
     if (kr != kIOReturnSuccess)
         return kr;
 
-    /* create_cq_out: cqn at +0x40+16 */
-    cq->cqNumber = OSReadBigInt32(out, 0x50) & 0xFFFFFF;
+    cq->cqNumber = static_cast<uint32_t>(mlxGetBits(out, 0x48, 24));
     return kIOReturnSuccess;
 }
 
@@ -84,43 +111,93 @@ kern_return_t MlxCQ::cmdDestroyCQ(uint32_t cqNumber)
                                   out, sizeof(out), 5000);
 }
 
-kern_return_t MlxCQ::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
+kern_return_t MlxCQ::createCQ(uint32_t entries,
+                              struct mlx_create_cq_resp *resp)
 {
+    /* Use at least one 4 KiB CQ page (64 CQEs); 32 PAS pages cap this
+     * implementation at 2048 entries. */
+    if (!resp || entries == 0 || entries > 2048)
+        return kIOReturnBadArgument;
+    if (entries < 64)
+        entries = 64;
     MlxCQContext *cq = (MlxCQContext *)IOMallocZero(sizeof(MlxCQContext));
     if (!cq)
         return kIOReturnNoMemory;
 
-    cq->logSize = 8;            /* 256 entries */
-    cq->cqeSize = cqeSize ? cqeSize : 64;
-    cq->dbRecordOffset = 0;
+    cq->logSize = 0;
+    while ((1u << cq->logSize) < entries)
+        cq->logSize++;
+    cq->cqeSize = sizeof(MlxCqe64);
+    if (fRoce->getCore()->getUAR()->allocDbSlots(2,
+                                                 &cq->dbRecordOffset) !=
+        kIOReturnSuccess) {
+        IOFree(cq, sizeof(MlxCQContext));
+        return kIOReturnNoResources;
+    }
     cq->compVector = 0;
     cq->armSn = 0;
 
     /* CQE buffer DMA attach: allocate a kernel DMA-coherent buffer, write its physical address to CQC PAS
      * (see create_cq_user, cq.c:717: the kernel allocates the CQ buffer) */
-    uint32_t cqBytes = (1u << cq->logSize) * cq->cqeSize;
+    uint32_t cqBytes = (1u << cq->logSize) * sizeof(MlxCqe64);
     IOBufferMemoryDescriptor *bufDesc =
         IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
             kernel_task, kIODirectionInOut, cqBytes, 0xFFFFFFF000ULL);
     if (!bufDesc) {
-        IOFree(cq, sizeof(MlxCQContext));
-        return kIOReturnNoMemory;
-    }
-    if (bufDesc->prepare(kIODirectionInOut) != kIOReturnSuccess) {
-        bufDesc->release();
+        fRoce->getCore()->getUAR()->freeDbSlots(cq->dbRecordOffset, 2);
         IOFree(cq, sizeof(MlxCQContext));
         return kIOReturnNoMemory;
     }
     memset(bufDesc->getBytesNoCopy(), 0, cqBytes);
+    for (uint32_t i = 0; i < (1u << cq->logSize); i++)
+        reinterpret_cast<MlxCqe64 *>(bufDesc->getBytesNoCopy())[i].op_own =
+            (0x0f << 4) | 1;
     cq->cqeBufAddr = (uint64_t)(uintptr_t)bufDesc->getBytesNoCopy();
-    cq->cqeDMA = bufDesc->getPhysicalSegment(0, 0);
+    cq->cqeDmaMap = IODMACommand::withSpecification(
+        kIODMACommandOutputHost64, 64, 4096, IODMACommand::kMapped,
+        cqBytes, 4096);
+    if (!cq->cqeDmaMap ||
+        cq->cqeDmaMap->setMemoryDescriptor(bufDesc) != kIOReturnSuccess) {
+        if (cq->cqeDmaMap) cq->cqeDmaMap->release();
+        cq->cqeDmaMap = NULL;
+        bufDesc->release();
+        fRoce->getCore()->getUAR()->freeDbSlots(cq->dbRecordOffset, 2);
+        IOFree(cq, sizeof(MlxCQContext));
+        return kIOReturnNoMemory;
+    }
+    UInt64 mapOffset = 0;
+    while (mapOffset < cqBytes && cq->numPages < 32) {
+        IODMACommand::Segment64 segments[8];
+        UInt32 count = 8;
+        if (cq->cqeDmaMap->gen64IOVMSegments(&mapOffset, segments,
+                                             &count) != kIOReturnSuccess ||
+            count == 0)
+            break;
+        for (UInt32 i = 0; i < count && cq->numPages < 32; i++) {
+            if ((segments[i].fIOVMAddr & 0xfff) ||
+                segments[i].fLength == 0 || segments[i].fLength > 4096) {
+                mapOffset = 0;
+                break;
+            }
+            cq->pageDMA[cq->numPages++] = segments[i].fIOVMAddr;
+        }
+    }
+    if (mapOffset != cqBytes || cq->numPages == 0) {
+        mlxUnmapDMA(cq->cqeDmaMap);
+        fRoce->getCore()->getUAR()->freeDbSlots(cq->dbRecordOffset, 2);
+        bufDesc->release();
+        IOFree(cq, sizeof(MlxCQContext));
+        return kIOReturnNoSpace;
+    }
+    cq->cqeDMA = cq->pageDMA[0];
     cq->cqeBufDesc = bufDesc;    /* held until destroyed */
 
     /* Bind to the completion EQ (vector 0) */
     uint32_t eqNumber = fRoce->getCore()->getEQ()->getCompEqNumber(0);
     kern_return_t kr = cmdCreateCQ(cq, eqNumber);
     if (kr != kIOReturnSuccess) {
-        bufDesc->complete();
+        mlxUnmapDMA(cq->cqeDmaMap);
+        fRoce->getCore()->getUAR()->freeDbSlots(cq->dbRecordOffset, 2);
         bufDesc->release();
         IOFree(cq, sizeof(MlxCQContext));
         return kr;
@@ -129,7 +206,8 @@ kern_return_t MlxCQ::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
     OSData *record = OSData::withBytesNoCopy(cq, sizeof(*cq));
     if (!record) {
         cmdDestroyCQ(cq->cqNumber);
-        bufDesc->complete();
+        mlxUnmapDMA(cq->cqeDmaMap);
+        fRoce->getCore()->getUAR()->freeDbSlots(cq->dbRecordOffset, 2);
         bufDesc->release();
         IOFree(cq, sizeof(MlxCQContext));
         return kIOReturnNoMemory;
@@ -140,12 +218,16 @@ kern_return_t MlxCQ::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
     record->release();
     if (!added) {
         cmdDestroyCQ(cq->cqNumber);
-        bufDesc->complete();
+        mlxUnmapDMA(cq->cqeDmaMap);
+        fRoce->getCore()->getUAR()->freeDbSlots(cq->dbRecordOffset, 2);
         bufDesc->release();
         IOFree(cq, sizeof(MlxCQContext));
         return kIOReturnNoMemory;
     }
-    *cqHandle = cq->cqNumber;
+    resp->cqHandle = cq->cqNumber;
+    resp->logSize = cq->logSize;
+    resp->cqeSize = cq->cqeSize;
+    resp->dbRecordOffset = cq->dbRecordOffset;
 
     IOLog("MlxCQ: CQ[%u] created log_size=%u eqn=%u cqe_dma=0x%llx\n",
           cq->cqNumber, cq->logSize, eqNumber, cq->cqeDMA);
@@ -163,9 +245,12 @@ kern_return_t MlxCQ::destroyCQ(uint32_t cqHandle)
             if (ctx && ctx->cqNumber == cqHandle) {
                 /* Release the CQE buffer */
                 if (ctx->cqeBufDesc) {
-                    ctx->cqeBufDesc->complete();
+                    mlxUnmapDMA(ctx->cqeDmaMap);
+                    ctx->cqeDmaMap = NULL;
                     ctx->cqeBufDesc->release();
                 }
+                fRoce->getCore()->getUAR()->freeDbSlots(
+                    ctx->dbRecordOffset, 2);
                 fCqTable->removeObject(i);
                 IOFree(ctx, sizeof(MlxCQContext));
                 break;
@@ -196,25 +281,51 @@ void MlxCQ::handleCompletion(uint32_t cqn)
 {
     /* See eq.c:106 mlx5_eq_comp_int + cq.c:41 mlx5_ib_cq_comp:
      *   look up the CQ by cqn → call the completion callback (comp_handler) */
-    MlxCQContext *ctx = lookup(cqn);
-    if (!ctx)
-        return;
-
-    ctx->armSn++;
-    ctx->completions++;
-    if (ctx->completionHandler)
-        ctx->completionHandler(cqn, ctx->completionContext);
+    IOLockLock(fLock);
+    for (uint32_t i = 0; i < fCqTable->getCount(); i++) {
+        MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+            fCqTable->getObject(i));
+        if (!ctx || ctx->cqNumber != cqn)
+            continue;
+        ctx->armSn++;
+        ctx->completions++;
+        if (ctx->completionHandler)
+            ctx->completionHandler(cqn, ctx->completionContext);
+        break;
+    }
+    IOLockUnlock(fLock);
     /* Complete: trigger userspace polling (later in P5: event channel) */
 }
 
 IOMemoryDescriptor *MlxCQ::getCqMemDesc(uint32_t cqHandle)
 {
-    MlxCQContext *ctx = lookup(cqHandle);
-    return ctx ? ctx->cqeBufDesc : NULL;
+    IOMemoryDescriptor *desc = NULL;
+    IOLockLock(fLock);
+    for (uint32_t i = 0; i < fCqTable->getCount(); i++) {
+        MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+            fCqTable->getObject(i));
+        if (ctx && ctx->cqNumber == cqHandle) {
+            desc = ctx->cqeBufDesc;
+            if (desc) desc->retain();
+            break;
+        }
+    }
+    IOLockUnlock(fLock);
+    return desc;
 }
 
 uint64_t MlxCQ::getCompletions(uint32_t cqHandle)
 {
-    MlxCQContext *ctx = lookup(cqHandle);
-    return ctx ? ctx->completions : 0;
+    uint64_t completions = 0;
+    IOLockLock(fLock);
+    for (uint32_t i = 0; i < fCqTable->getCount(); i++) {
+        MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+            fCqTable->getObject(i));
+        if (ctx && ctx->cqNumber == cqHandle) {
+            completions = ctx->completions;
+            break;
+        }
+    }
+    IOLockUnlock(fLock);
+    return completions;
 }

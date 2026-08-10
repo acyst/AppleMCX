@@ -17,6 +17,26 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxAH, OSObject)
 
+void MlxAH::free()
+{
+    if (fAhTable) {
+        while (fAhTable->getCount()) {
+            MlxAHContext *ctx = mlxRecordValue<MlxAHContext>(
+                fAhTable->getObject(0));
+            if (ctx)
+                IOFree(ctx, sizeof(*ctx));
+            fAhTable->removeObject(static_cast<unsigned int>(0));
+        }
+        fAhTable->release();
+        fAhTable = NULL;
+    }
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = NULL;
+    }
+    super::free();
+}
+
 bool MlxAH::init(MlxRoCE *roce)
 {
     if (!super::init())
@@ -25,7 +45,7 @@ bool MlxAH::init(MlxRoCE *roce)
     fAhTable = OSArray::withCapacity(16);
     fLock = IOLockAlloc();
     fNextHandle = 1;
-    return true;
+    return fAhTable && fLock;
 }
 
 void MlxAH::encodeAV(const struct mlx_create_ah_req *req, MlxAV *av)

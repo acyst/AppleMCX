@@ -22,12 +22,15 @@ class MlxUserClient : public IOUserClient {
 
 public:
     /* IOService lifecycle */
+    virtual bool initWithTask(task_t owningTask, void *securityToken,
+                              UInt32 type,
+                              OSDictionary *properties) APPLE_KEXT_OVERRIDE;
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* IOUserClient */
     virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
-    virtual IOExternalMethod *getExternalMethodForIndex(UInt32 selector) APPLE_KEXT_OVERRIDE;
     virtual IOReturn externalMethod(uint32_t selector,
                                     IOExternalMethodArguments *args,
                                     IOExternalMethodDispatch *dispatch,
@@ -40,6 +43,8 @@ public:
     static const IOExternalMethodDispatch sMethods[];
     static IOReturn sQueryDevice(OSObject *t, void *ref,
                                  IOExternalMethodArguments *args);
+    static IOReturn sQueryPort(OSObject *t, void *ref,
+                               IOExternalMethodArguments *args);
     static IOReturn sCreateQP(OSObject *t, void *ref,
                               IOExternalMethodArguments *args);
     static IOReturn sModifyQP(OSObject *t, void *ref,
@@ -90,12 +95,21 @@ public:
                                    IOExternalMethodArguments *args);
 
 private:
+    void cleanup();
+    void releaseOwnedResources();
+    bool addOwned(OSArray *table, uint32_t handle);
+    bool owns(OSArray *table, uint32_t handle);
+    bool removeOwned(OSArray *table, uint32_t handle);
+    bool takeOwned(OSArray *table, uint32_t *handle);
+
     IOReturn queryDevice(struct mlx_query_device_resp *resp);
+    IOReturn queryPort(struct mlx_query_port_resp *resp);
     IOReturn createQP(const struct mlx_create_qp_req *req,
                       struct mlx_create_qp_resp *resp);
     IOReturn modifyQP(const struct mlx_modify_qp_req *req);
     IOReturn destroyQP(uint32_t qpn);
-    IOReturn createCQ(uint32_t cqeSize, uint32_t *cqHandle);
+    IOReturn createCQ(uint32_t entries,
+                      struct mlx_create_cq_resp *resp);
     IOReturn destroyCQ(uint32_t cqHandle);
     IOReturn regMR(const struct mlx_reg_mr_req *req,
                    struct mlx_reg_mr_resp *resp);
@@ -106,9 +120,12 @@ private:
 
     MlxRoCE       *fRoce;
     MlxPCIDriver  *fCore;
+    task_t          fOwningTask;
     OSArray       *fOwnedQp;    /* QPs owned by the client */
+    OSArray       *fOwnedCq;
     OSArray       *fOwnedMr;
     OSArray       *fOwnedAh;
+    IOLock        *fOwnedLock;
     uint32_t       fActiveCq;   /* most recently mapped CQ (used by clientMemoryForType) */
 };
 

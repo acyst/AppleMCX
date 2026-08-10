@@ -17,13 +17,41 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxDMA, OSObject)
 
+void MlxDMA::free()
+{
+    if (fPendingReqs) {
+        while (fPendingReqs->getCount()) {
+            MlxDMAReq *req = mlxRecordValue<MlxDMAReq>(
+                fPendingReqs->getObject(0));
+            if (req) {
+                if (req->dmaCommand) {
+                    req->dmaCommand->clearMemoryDescriptor();
+                    req->dmaCommand->release();
+                }
+                if (req->memDesc)
+                    req->memDesc->release();
+            }
+            fPendingReqs->removeObject(static_cast<unsigned int>(0));
+        }
+        fPendingReqs->release();
+        fPendingReqs = NULL;
+    }
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = NULL;
+    }
+    super::free();
+}
+
 bool MlxDMA::init()
 {
     if (!super::init())
         return false;
+    fPendingReqs = NULL;
+    fLock = NULL;
     fPendingReqs = OSArray::withCapacity(16);
     fLock = IOLockAlloc();
-    return true;
+    return fPendingReqs && fLock;
 }
 
 kern_return_t MlxDMA::getSegments(IOMemoryDescriptor *mem,
@@ -35,20 +63,22 @@ kern_return_t MlxDMA::getSegments(IOMemoryDescriptor *mem,
         kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1);
     if (!cmd)
         return kIOReturnNoMemory;
-    cmd->setMemoryDescriptor(mem);
+    IOReturn mapKr = cmd->setMemoryDescriptor(mem);
+    if (mapKr != kIOReturnSuccess) {
+        cmd->release();
+        return mapKr;
+    }
 
     uint32_t n = 0;
     UInt64 offset = 0;
     while (offset < mem->getLength() && n < MLX_DMA_MAX_SEGS) {
-        UInt64 segOffset = offset;
         IODMACommand::Segment64 segs[8];
         UInt32 numSeg = 8;
-        kern_return_t kr = cmd->gen64IOVMSegments(&segOffset, segs, &numSeg);
+        kern_return_t kr = cmd->gen64IOVMSegments(&offset, segs, &numSeg);
         if (kr != kIOReturnSuccess || numSeg == 0)
             break;
         for (UInt32 i = 0; i < numSeg && n < MLX_DMA_MAX_SEGS; i++) {
             paList[n++] = segs[i].fIOVMAddr;
-            offset += segs[i].fLength;
         }
     }
     cmd->clearMemoryDescriptor();
@@ -65,6 +95,7 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
         return kIOReturnBadArgument;
 
     memset(req, 0, sizeof(MlxDMAReq));
+    req->ownerTask = current_task();
     req->virtAddr = virtAddr;
     req->length = length;
 
@@ -74,12 +105,6 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
     if (!mem)
         return kIOReturnNoMemory;
 
-    IOReturn kr = mem->prepare(kIODirectionInOut);
-    if (kr != kIOReturnSuccess) {
-        mem->release();
-        return kr;
-    }
-
     /* Enumerate physical segments + segment lengths */
     uint64_t paList[MLX_DMA_MAX_SEGS];
     uint64_t paLen[MLX_DMA_MAX_SEGS];
@@ -88,11 +113,15 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
     IODMACommand *cmd = IODMACommand::withSpecification(
         kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1);
     if (!cmd) {
-        mem->complete();
         mem->release();
         return kIOReturnNoMemory;
     }
-    cmd->setMemoryDescriptor(mem);
+    IOReturn kr = cmd->setMemoryDescriptor(mem);
+    if (kr != kIOReturnSuccess) {
+        cmd->release();
+        mem->release();
+        return kr;
+    }
 
     UInt64 offset = 0;
     while (offset < length && numSegs < MLX_DMA_MAX_SEGS) {
@@ -109,25 +138,27 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
             numSegs++;
         }
     }
-    cmd->clearMemoryDescriptor();
-    cmd->release();
-
-    if (numSegs == 0) {
-        mem->complete();
+    if (numSegs == 0 || offset != length) {
+        cmd->clearMemoryDescriptor();
+        cmd->release();
         mem->release();
-        return kIOReturnIOError;
+        return (numSegs == MLX_DMA_MAX_SEGS) ? kIOReturnNoSpace :
+                                               kIOReturnIOError;
     }
 
     memcpy(req->paList, paList, sizeof(uint64_t) * numSegs);
     memcpy(req->paLenList, paLen, sizeof(uint64_t) * numSegs);
     req->numSegs = numSegs;
     req->memDesc = mem;   /* held until unpin */
+    req->dmaCommand = cmd;
 
     OSData *record = OSData::withBytes(req, sizeof(*req));
     if (!record) {
-        mem->complete();
+        cmd->clearMemoryDescriptor();
+        cmd->release();
         mem->release();
         req->memDesc = NULL;
+        req->dmaCommand = NULL;
         return kIOReturnNoMemory;
     }
     IOLockLock(fLock);
@@ -135,9 +166,11 @@ kern_return_t MlxDMA::pinUserMemory(uint64_t virtAddr, uint64_t length,
     IOLockUnlock(fLock);
     record->release();
     if (!added) {
-        mem->complete();
+        cmd->clearMemoryDescriptor();
+        cmd->release();
         mem->release();
         req->memDesc = NULL;
+        req->dmaCommand = NULL;
         return kIOReturnNoMemory;
     }
 
@@ -161,14 +194,18 @@ void MlxDMA::unpinMemory(MlxDMAReq *req)
     }
     IOLockUnlock(fLock);
 
+    if (req->dmaCommand) {
+        req->dmaCommand->clearMemoryDescriptor();
+        req->dmaCommand->release();
+        req->dmaCommand = NULL;
+    }
     if (req->memDesc) {
-        req->memDesc->complete();
         req->memDesc->release();
         req->memDesc = NULL;
     }
 }
 
-uint64_t MlxDMA::lookupPhys(uint64_t virtAddr)
+uint64_t MlxDMA::lookupPhys(task_t ownerTask, uint64_t virtAddr)
 {
     /* Lookup: virtual address → physical address (for user-space post_send data segments)
      * Exact algorithm: accumulate across physical segments to locate the segment and in-segment offset of virtAddr */
@@ -177,11 +214,12 @@ uint64_t MlxDMA::lookupPhys(uint64_t virtAddr)
     for (uint32_t i = 0; i < fPendingReqs->getCount(); i++) {
         MlxDMAReq *req = mlxRecordValue<MlxDMAReq>(
             fPendingReqs->getObject(i));
-        if (!req || virtAddr < req->virtAddr ||
-            virtAddr >= req->virtAddr + req->length)
+        if (!req || req->ownerTask != ownerTask || virtAddr < req->virtAddr)
             continue;
 
         uint64_t offset = virtAddr - req->virtAddr;
+        if (offset >= req->length)
+            continue;
         uint64_t acc = 0;
         for (uint32_t s = 0; s < req->numSegs; s++) {
             uint64_t segLen = req->paLenList[s];

@@ -24,6 +24,85 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxEQ, OSObject)
 
+static void
+free_eq_entry(MlxEqEntry *eq)
+{
+    if (!eq)
+        return;
+    mlxUnmapDMA(eq->fDmaMap);
+    eq->fDmaMap = NULL;
+    if (eq->fDesc) {
+        eq->fDesc->release();
+        eq->fDesc = NULL;
+    }
+    eq->ringBuf = NULL;
+}
+
+void MlxEQ::shutdown()
+{
+    if (fAsyncIS) {
+        fAsyncIS->disable();
+        if (fWorkLoop) fWorkLoop->removeEventSource(fAsyncIS);
+        fAsyncIS->release();
+        fAsyncIS = NULL;
+    }
+    if (fCompIS) {
+        for (uint32_t i = 0; i < fNumCompEqs; i++) {
+            if (!fCompIS[i])
+                continue;
+            fCompIS[i]->disable();
+            if (fWorkLoop) fWorkLoop->removeEventSource(fCompIS[i]);
+            fCompIS[i]->release();
+            fCompIS[i] = NULL;
+        }
+    }
+
+    if (fOwner && fOwner->getCmd() && fOwner->getCmd()->isUp()) {
+        for (uint32_t i = 0; i < fNumCompEqs; i++) {
+            if (fCompEqs && fCompEqs[i].eqNumber) {
+                destroyEq(fCompEqs[i].eqNumber);
+                fCompEqs[i].eqNumber = 0;
+            }
+        }
+        for (uint32_t i = 0; i < fNumAsyncEqs; i++) {
+            if (fAsyncEqs && fAsyncEqs[i].eqNumber) {
+                destroyEq(fAsyncEqs[i].eqNumber);
+                fAsyncEqs[i].eqNumber = 0;
+            }
+        }
+    }
+}
+
+void MlxEQ::free()
+{
+    shutdown();
+    if (fCompEqs) {
+        for (uint32_t i = 0; i < fNumCompEqs; i++)
+            free_eq_entry(&fCompEqs[i]);
+        IOFree(fCompEqs, sizeof(MlxEqEntry) * fNumCompEqs);
+        fCompEqs = NULL;
+    }
+    if (fAsyncEqs) {
+        for (uint32_t i = 0; i < fNumAsyncEqs; i++)
+            free_eq_entry(&fAsyncEqs[i]);
+        IOFree(fAsyncEqs, sizeof(MlxEqEntry) * fNumAsyncEqs);
+        fAsyncEqs = NULL;
+    }
+    if (fCompIS) {
+        IOFree(fCompIS, sizeof(IOInterruptEventSource *) * fNumCompEqs);
+        fCompIS = NULL;
+    }
+    if (fWorkLoop) {
+        fWorkLoop->release();
+        fWorkLoop = NULL;
+    }
+    if (fNotifierLock) {
+        IOLockFree(fNotifierLock);
+        fNotifierLock = NULL;
+    }
+    super::free();
+}
+
 /* Initialize the owner bit of each EQE in the ring buffer */
 static void
 init_eq_buf(MlxEqEntry *eq)
@@ -32,7 +111,7 @@ init_eq_buf(MlxEqEntry *eq)
     uint8_t *buf = (uint8_t *)eq->ringBuf;
     uint32_t size = 1u << eq->logSize;
     for (uint32_t i = 0; i < size; i++) {
-        MlxEqe *eqe = (MlxEqe *)(buf + (i * 32));
+        MlxEqe *eqe = (MlxEqe *)(buf + (i * sizeof(MlxEqe)));
         eqe->owner = 1;
     }
     mlxMemoryBarrier();
@@ -69,19 +148,50 @@ bool MlxEQ::init(MlxPCIDriver *owner, uint32_t numCompVectors)
 
 kern_return_t MlxEQ::allocEqBuf(MlxEqEntry *eq)
 {
-    /* Allocate the EQ ring buffer (32B EQE * depth + spares) */
+    /* Allocate the EQ ring buffer (64B EQE * depth + spares). */
     uint32_t sizeBytes = (1u << eq->logSize) + MLX_NUM_SPARE_EQE;
-    sizeBytes *= 32;
+    sizeBytes *= sizeof(MlxEqe);
+    sizeBytes = (sizeBytes + 4095) & ~4095u;
 
     eq->fDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut, sizeBytes, 0xFFFFFFF000ULL);
     if (!eq->fDesc)
         return kIOReturnNoMemory;
-    if (eq->fDesc->prepare(kIODirectionInOut) != kIOReturnSuccess)
-        return kIOReturnNoMemory;
-
     eq->ringBuf = eq->fDesc->getBytesNoCopy();
-    eq->ringDMA = eq->fDesc->getPhysicalSegment(0, 0);
+    eq->fDmaMap = IODMACommand::withSpecification(
+        kIODMACommandOutputHost64, 64, 4096, IODMACommand::kMapped,
+        sizeBytes, 4096);
+    if (!eq->fDmaMap ||
+        eq->fDmaMap->setMemoryDescriptor(eq->fDesc) != kIOReturnSuccess) {
+        if (eq->fDmaMap) eq->fDmaMap->release();
+        eq->fDmaMap = NULL;
+        eq->fDesc->release();
+        eq->fDesc = NULL;
+        return kIOReturnNoMemory;
+    }
+
+    UInt64 offset = 0;
+    eq->numPages = 0;
+    while (offset < sizeBytes && eq->numPages < MLX_MAX_EQ_PAGES) {
+        IODMACommand::Segment64 segments[8];
+        UInt32 count = 8;
+        IOReturn kr = eq->fDmaMap->gen64IOVMSegments(&offset, segments, &count);
+        if (kr != kIOReturnSuccess || count == 0)
+            break;
+        for (UInt32 i = 0; i < count && eq->numPages < MLX_MAX_EQ_PAGES; i++) {
+            if ((segments[i].fIOVMAddr & 0xFFF) || segments[i].fLength > 4096)
+                break;
+            eq->pageDMA[eq->numPages++] = segments[i].fIOVMAddr;
+        }
+    }
+    if (offset != sizeBytes || eq->numPages == 0) {
+        mlxUnmapDMA(eq->fDmaMap);
+        eq->fDmaMap = NULL;
+        eq->fDesc->release();
+        eq->fDesc = NULL;
+        return kIOReturnNoSpace;
+    }
+    eq->ringDMA = eq->pageDMA[0];
     memset(eq->ringBuf, 0, sizeBytes);
     init_eq_buf(eq);
     return kIOReturnSuccess;
@@ -95,12 +205,11 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
     if (kr != kIOReturnSuccess)
         return kr;
 
-    /* Build the CREATE_EQ command:
-     * create_eq_in = 64B header + eqc(192B) + event_bitmask(128B) + pas[] */
+    /* CREATE_EQ IFC: EQC@0x80 bits, event mask@0x2c0, PAS@0x880. */
     uint8_t in[4096] = {};
-    uint32_t eqcOffset = 0x40;                    /* 64-byte command header */
-    uint32_t maskOffset = eqcOffset + 192;        /* eqc is 192 bytes */
-    uint32_t pasOffset = maskOffset + 128;        /* event_bitmask is 128 bytes */
+    uint32_t eqcOffset = 0x80 / 8;
+    uint32_t maskOffset = 0x2c0 / 8;
+    uint32_t pasOffset = 0x880 / 8;
 
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_EQ);
 
@@ -110,29 +219,21 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
      *   uar_page[0x68](24bit) → bit 0x68 = byte 0xD bit0, 24 bits → bytes 0xD/0xE/0xF
      *   intr[0xB4](12bit) → bit 0xB4 = byte 0x16 bit4, 12 bits → byte 0x16 bits[7:4] + byte 0x17 */
     uint8_t *eqc = in + eqcOffset;
-    /* st = 0x4 (EQ), 4 bits starting at bit 0x10 */
-    eqc[0x02] = (uint8_t)((eqc[0x02] & 0xF0) | 0x4);
-    /* log_eq_size: 5 bits starting at bit 0x63 → byte 0xC bits[7:3] */
-    eqc[0x0C] = (uint8_t)((eq->logSize << 3) & 0xF8);
-    /* uar_page: 24 bits starting at bit 0x68 → bytes 0xD/0xE/0xF */
+    mlxSetBits(eqc, 0x10, 4, 0x4);
+    mlxSetBits(eqc, 0x63, 5, eq->logSize);
     uint32_t uarPage = fOwner->getUAR() ? fOwner->getUAR()->getBootUarIndex() : 0;
-    eqc[0x0D] = (uint8_t)((uarPage >> 16) & 0xFF);
-    eqc[0x0E] = (uint8_t)((uarPage >> 8) & 0xFF);
-    eqc[0x0F] = (uint8_t)(uarPage & 0xFF);
-    /* intr: 12 bits starting at bit 0xB4 → byte 0x16 bits[7:4] + byte 0x17 */
-    eqc[0x16] = (uint8_t)((vecidx << 4) & 0xF0);
-    eqc[0x17] = (uint8_t)((vecidx >> 4) & 0xFF);
-    /* log_page_size: 5 bits starting at bit 0xD8 → byte 0x1B bits[7:3] (PAGE_SHIFT=12 → 0) */
-    eqc[0x1B] = (uint8_t)((0 << 3) & 0xF8);
+    mlxSetBits(eqc, 0x68, 24, uarPage);
+    mlxSetBits(eqc, 0xb4, 12, vecidx);
+    mlxSetBits(eqc, 0xc3, 5, 0); /* 4 KiB pages */
 
     /* event_bitmask (128-bit) */
-    for (int i = 0; i < 4; i++)
-        OSWriteBigInt32(in, maskOffset + (i * 4), mask[i]);
+    for (uint32_t i = 0; i < 4; i++)
+        OSWriteBigInt64(in, maskOffset + (i * 8), mask[i]);
 
     /* PAS (physical address list, 8 bytes each) */
-    uint32_t numPages = 1;   /* MVP: single-page buffer */
+    uint32_t numPages = eq->numPages;
     for (uint32_t i = 0; i < numPages; i++)
-        OSWriteBigInt64(in, pasOffset + (i * 8), eq->ringDMA);
+        OSWriteBigInt64(in, pasOffset + (i * 8), eq->pageDMA[i]);
 
     uint32_t inSize = pasOffset + (numPages * 8);
     uint8_t out[64] = {};
@@ -140,14 +241,15 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
     MlxCmdInOut cmd = { in, inSize, out, sizeof(out), MLX_CMD_OP_CREATE_EQ };
     kr = fOwner->getCmd()->exec(&cmd, 5000);
     if (kr != kIOReturnSuccess) {
-        eq->fDesc->complete();
+        eq->fDmaMap->clearMemoryDescriptor();
+        eq->fDmaMap->release();
+        eq->fDmaMap = NULL;
         eq->fDesc->release();
         eq->fDesc = NULL;
         return kr;
     }
 
-    /* Read back eq_number (create_eq_out, offset 0x40+24) */
-    eq->eqNumber = OSReadBigInt32(out, 0x40 + 24) & 0xFF;
+    eq->eqNumber = static_cast<uint32_t>(mlxGetBits(out, 0x58, 8));
     eq->irqVector = vecidx;
     eq->doorbellOffset = MLX_EQ_DOORBELL;
     eq->consIndex = 0;
@@ -176,11 +278,7 @@ kern_return_t MlxEQ::createAsyncEqs()
      * [2] pages_eq: PAGE_REQUEST */
     uint32_t cmdMask[4] = {};
     cmdMask[0] = 1u << (MLX_EVENT_TYPE_CMD & 31);
-    if (MLX_EVENT_TYPE_CMD >= 32)
-        cmdMask[1] = 1u << (MLX_EVENT_TYPE_CMD - 32);
     cmdMask[0] |= 1u << (MLX_EVENT_TYPE_PAGE_REQUEST & 31);
-    if (MLX_EVENT_TYPE_PAGE_REQUEST >= 32)
-        cmdMask[1] |= 1u << (MLX_EVENT_TYPE_PAGE_REQUEST - 32);
 
     fAsyncEqs[0].logSize = 8;    /* 256 entries */
     kern_return_t kr = createEq(&fAsyncEqs[0], 0, cmdMask);
@@ -213,7 +311,7 @@ kern_return_t MlxEQ::createCompEqs()
 
     for (uint32_t i = 0; i < fNumCompEqs; i++) {
         fCompEqs[i].logSize = 10;    /* 1024 entries */
-        kern_return_t kr = createEq(&fCompEqs[i], i, compMask);
+        kern_return_t kr = createEq(&fCompEqs[i], i + 1, compMask);
         if (kr != kIOReturnSuccess)
             return kr;
     }
@@ -272,9 +370,12 @@ void MlxEQ::updateCi(MlxEqEntry *eq, bool arm)
      *   write cons_index (low 24 bits) + eqn<<24 to the doorbell
      *   write +0x40 (MLX_EQ_DOORBELL) when armed, otherwise +0x42 */
     uint32_t ci = (eq->consIndex & 0xFFFFFF) | (eq->eqNumber << 24);
-    /* MVP: doorbell accessed via UAR, implemented after ioremap in phase P1 */
-    (void)ci;
-    (void)arm;
+    MlxUAR *uar = fOwner ? fOwner->getUAR() : NULL;
+    IOMemoryMap *map = uar ? uar->getUarMap() : NULL;
+    if (!map)
+        return;
+    uint32_t offset = eq->doorbellOffset + (arm ? 0 : 8);
+    mlxMMIOWrite32BE(map, offset, ci);
 }
 
 void MlxEQ::handleAsyncEqe(uint32_t eqIdx)
@@ -284,7 +385,8 @@ void MlxEQ::handleAsyncEqe(uint32_t eqIdx)
     uint32_t size = 1u << eq->logSize;
 
     for (uint32_t i = 0; i < size; i++) {
-        MlxEqe *eqe = (MlxEqe *)(buf + ((eq->consIndex & (size - 1)) * 32));
+        MlxEqe *eqe = (MlxEqe *)(buf +
+            ((eq->consIndex & (size - 1)) * sizeof(MlxEqe)));
         if (!isNewEqe(eq, eqe))
             break;
         mlxMemoryBarrier();
@@ -311,7 +413,8 @@ void MlxEQ::handleCompEqe(uint32_t eqIdx)
     uint32_t size = 1u << eq->logSize;
 
     for (uint32_t i = 0; i < size; i++) {
-        MlxEqe *eqe = (MlxEqe *)(buf + ((eq->consIndex & (size - 1)) * 32));
+        MlxEqe *eqe = (MlxEqe *)(buf +
+            ((eq->consIndex & (size - 1)) * sizeof(MlxEqe)));
         if (!isNewEqe(eq, eqe))
             break;
         mlxMemoryBarrier();
@@ -332,18 +435,29 @@ void MlxEQ::handleCompEqe(uint32_t eqIdx)
     updateCi(eq, true);
 }
 
-void MlxEQ::asyncIntrHandler(OSObject *target, void *refCon,
-                             IOService *nub, int source)
+void MlxEQ::asyncIntrHandler(OSObject *owner,
+                             IOInterruptEventSource *sender, int count)
 {
-    MlxEQ *self = (MlxEQ *)refCon;
-    self->handleAsyncEqe((uint32_t)source);
+    (void)sender;
+    (void)count;
+    MlxEQ *self = OSDynamicCast(MlxEQ, owner);
+    if (!self)
+        return;
+    /* Vector 0 is shared by the command, async, and page-request EQs. */
+    for (uint32_t i = 0; i < self->fNumAsyncEqs; i++)
+        self->handleAsyncEqe(i);
 }
 
-void MlxEQ::compIntrHandler(OSObject *target, void *refCon,
-                            IOService *nub, int source)
+void MlxEQ::compIntrHandler(OSObject *owner,
+                            IOInterruptEventSource *sender, int count)
 {
-    MlxEQ *self = (MlxEQ *)refCon;
-    self->handleCompEqe((uint32_t)source);
+    (void)count;
+    MlxEQ *self = OSDynamicCast(MlxEQ, owner);
+    if (!self || !sender)
+        return;
+    int vector = sender->getIntIndex();
+    if (vector > 0 && static_cast<uint32_t>(vector) <= self->fNumCompEqs)
+        self->handleCompEqe(static_cast<uint32_t>(vector - 1));
 }
 
 kern_return_t MlxEQ::setupInterrupts()
@@ -355,9 +469,7 @@ kern_return_t MlxEQ::setupInterrupts()
 
     /* Async interrupt source */
     fAsyncIS = IOInterruptEventSource::interruptEventSource(
-        this,
-        OSMemberFunctionCast(IOInterruptEventAction, this,
-                             &MlxEQ::asyncIntrHandler),
+        this, &MlxEQ::asyncIntrHandler,
         fOwner->getPCI(), 0);
     if (fAsyncIS && fWorkLoop->addEventSource(fAsyncIS) == kIOReturnSuccess)
         fAsyncIS->enable();
@@ -372,9 +484,7 @@ kern_return_t MlxEQ::setupInterrupts()
 
     for (uint32_t i = 0; i < fNumCompEqs; i++) {
         fCompIS[i] = IOInterruptEventSource::interruptEventSource(
-            this,
-            OSMemberFunctionCast(IOInterruptEventAction, this,
-                                 &MlxEQ::compIntrHandler),
+            this, &MlxEQ::compIntrHandler,
             fOwner->getPCI(), i + 1);   /* vectors 1..N */
         if (fCompIS[i]) {
             if (fWorkLoop->addEventSource(fCompIS[i]) != kIOReturnSuccess)

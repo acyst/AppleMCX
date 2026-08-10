@@ -24,13 +24,24 @@ enum {
     kMlxUCMemIndexCqe        = 2,   /* CQ buffer (optional) */
 };
 
-/* createCQ response (extended: returns CQE buffer info) */
+struct mlx_create_cq_req {
+    uint32_t entries;
+};
+
+/* createCQ response; the CQ buffer is mapped through clientMemoryForType. */
 struct mlx_create_cq_resp {
     uint32_t  cqHandle;
-    uint64_t  cqeBufAddr;       /* CQE buffer virtual address (after userspace mapping) */
     uint32_t  logSize;          /* log of depth */
     uint32_t  cqeSize;
+    uint32_t  dbRecordOffset;
 };
+
+#if defined(__cplusplus)
+static_assert(sizeof(struct mlx_create_cq_req) == 4,
+              "mlx_create_cq_req ABI mismatch");
+static_assert(sizeof(struct mlx_create_cq_resp) == 16,
+              "mlx_create_cq_resp ABI mismatch");
+#endif
 
 /* externalMethod selector */
 enum {
@@ -227,10 +238,9 @@ struct mlx_create_qp_req {
 struct mlx_create_qp_resp {
     uint32_t  qpn;
     uint32_t  sqStrideSize;     /* WQE stride after alignment */
-    uint64_t  sqPhys;           /* SQ buffer physical address (DMA) */
-    uint64_t  rqPhys;           /* RQ buffer physical address (DMA) */
-    uint64_t  sqDbPhys;         /* SQ DB record physical address */
-    uint32_t  rsvd;
+    uint32_t  dbRecordOffset;   /* RQ/SQ DB record pair in mapped DB page */
+    uint32_t  bfOffset;         /* BF register offset in mapped UAR */
+    uint64_t  rsvd[2];
 };
 
 /* modifyQP (state machine) */

@@ -20,6 +20,38 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxMR, OSObject)
 
+void MlxMR::free()
+{
+    if (fMrTable) {
+        while (fMrTable->getCount()) {
+            MlxMRContext *ctx = mlxRecordValue<MlxMRContext>(
+                fMrTable->getObject(0));
+            if (ctx) {
+                uint32_t mkey = ctx->mrHandle;
+                if (fRoce && fRoce->getCore() &&
+                    fRoce->getCore()->getCmd() &&
+                    fRoce->getCore()->getCmd()->isUp()) {
+                    if (deregMR(mkey) == kIOReturnSuccess)
+                        continue;
+                }
+                if (ctx->fDmaCommand)
+                    mlxUnmapDMA(ctx->fDmaCommand);
+                if (ctx->fMemDesc)
+                    ctx->fMemDesc->release();
+                IOFree(ctx, sizeof(*ctx));
+            }
+            fMrTable->removeObject(static_cast<unsigned int>(0));
+        }
+        fMrTable->release();
+        fMrTable = NULL;
+    }
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = NULL;
+    }
+    super::free();
+}
+
 /* Access permission bits (see mr.c set_mkc_access_pd_addr_fields) */
 #define MLX_MKC_ACCESS_LR      (1u << 0)   /* local read */
 #define MLX_MKC_ACCESS_LW      (1u << 1)   /* local write */
@@ -35,38 +67,53 @@ bool MlxMR::init(MlxRoCE *roce)
     fCore = roce->getCore();
     fMrTable = OSArray::withCapacity(16);
     fLock = IOLockAlloc();
-    return true;
+    return fMrTable && fLock;
 }
 
 kern_return_t MlxMR::buildPBL(IOMemoryDescriptor *mem, uint64_t *paList,
-                              uint32_t *numSegs)
+                              uint32_t *numSegs, IODMACommand **dmaCommand)
 {
-    /* Iterate over physical segments to fill the PBL (see mr.c reg_create: ib_umem → MTT) */
+    if (!mem || !paList || !numSegs || !dmaCommand)
+        return kIOReturnBadArgument;
+    *dmaCommand = NULL;
     uint32_t n = 0;
-    IOByteCount offset = 0;
-    while (offset < mem->getLength()) {
-        IODMACommand *cmd = IODMACommand::withSpecification(
-            kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1);
-        if (!cmd)
-            break;
-        cmd->setMemoryDescriptor(mem);
-        UInt64 segOffset = offset;
+    IODMACommand *cmd = IODMACommand::withSpecification(
+        kIODMACommandOutputHost64, 64, 4096, IODMACommand::kMapped,
+        mem->getLength(), 4096);
+    if (!cmd)
+        return kIOReturnNoMemory;
+    IOReturn kr = cmd->setMemoryDescriptor(mem);
+    if (kr != kIOReturnSuccess) {
+        cmd->release();
+        return kr;
+    }
+
+    UInt64 offset = 0;
+    while (offset < mem->getLength() && n < MLX_MAX_MR_SEGMENTS) {
         IODMACommand::Segment64 segs[8];
         UInt32 numSeg = 8;
-        kern_return_t kr = cmd->gen64IOVMSegments(&segOffset, segs, &numSeg);
-        cmd->clearMemoryDescriptor();
-        cmd->release();
-        if (kr != kIOReturnSuccess)
+        kr = cmd->gen64IOVMSegments(&offset, segs, &numSeg);
+        if (kr != kIOReturnSuccess || numSeg == 0)
             break;
         for (UInt32 i = 0; i < numSeg && n < MLX_MAX_MR_SEGMENTS; i++) {
+            if ((segs[i].fIOVMAddr & 0xfff) || segs[i].fLength != 4096)
+                break;
             paList[n++] = segs[i].fIOVMAddr;
-            offset += segs[i].fLength;
         }
-        if (n >= MLX_MAX_MR_SEGMENTS)
-            break;
+    }
+    if (offset != mem->getLength()) {
+        cmd->clearMemoryDescriptor();
+        cmd->release();
+        return kIOReturnNoSpace;
     }
     *numSegs = n;
-    return (n > 0) ? kIOReturnSuccess : kIOReturnIOError;
+    if (!n) {
+        cmd->clearMemoryDescriptor();
+        cmd->release();
+        return kIOReturnIOError;
+    }
+    *dmaCommand = cmd;
+    return kIOReturnSuccess;
 }
 
 kern_return_t MlxMR::cmdCreateMKey(const uint64_t *paList, uint32_t numSegs,
@@ -121,8 +168,7 @@ kern_return_t MlxMR::cmdCreateMKey(const uint64_t *paList, uint32_t numSegs,
     if (kr != kIOReturnSuccess)
         return kr;
 
-    /* create_mkey_out: mkey_index at +0x48 (24bit) */
-    uint32_t mkeyIndex = OSReadBigInt32(out, 0x48) & 0xFFFFFF;
+    uint32_t mkeyIndex = static_cast<uint32_t>(mlxGetBits(out, 0x48, 24));
     *mkey = mkeyIndex;
     /* lkey = mkey_index (low 24 bits), rkey = mkey */
     *lkey = mkeyIndex;
@@ -156,17 +202,12 @@ kern_return_t MlxMR::regMR(const struct mlx_reg_mr_req *req,
         current_task());
     if (!mem)
         return kIOReturnNoMemory;
-    if (mem->prepare(kIODirectionInOut) != kIOReturnSuccess) {
-        mem->release();
-        return kIOReturnIOError;
-    }
-
     /* Build the PBL */
     uint64_t paList[MLX_MAX_MR_SEGMENTS];
     uint32_t numSegs = 0;
-    kern_return_t kr = buildPBL(mem, paList, &numSegs);
+    IODMACommand *dmaCommand = NULL;
+    kern_return_t kr = buildPBL(mem, paList, &numSegs, &dmaCommand);
     if (kr != kIOReturnSuccess) {
-        mem->complete();
         mem->release();
         return kr;
     }
@@ -177,7 +218,8 @@ kern_return_t MlxMR::regMR(const struct mlx_reg_mr_req *req,
                        req->accessFlags, req->pd,
                        &mkey, &lkey, &rkey);
     if (kr != kIOReturnSuccess) {
-        mem->complete();
+        dmaCommand->clearMemoryDescriptor();
+        dmaCommand->release();
         mem->release();
         return kr;
     }
@@ -193,11 +235,13 @@ kern_return_t MlxMR::regMR(const struct mlx_reg_mr_req *req,
         ctx->length = req->length;
         ctx->accessFlags = req->accessFlags;
         ctx->fMemDesc = mem;
+        ctx->fDmaCommand = dmaCommand;
         OSData *record = OSData::withBytesNoCopy(ctx, sizeof(*ctx));
         if (!record) {
             IOFree(ctx, sizeof(MlxMRContext));
             cmdDestroyMKey(mkey);
-            mem->complete();
+            dmaCommand->clearMemoryDescriptor();
+            dmaCommand->release();
             mem->release();
             return kIOReturnNoMemory;
         }
@@ -208,13 +252,15 @@ kern_return_t MlxMR::regMR(const struct mlx_reg_mr_req *req,
         if (!added) {
             IOFree(ctx, sizeof(MlxMRContext));
             cmdDestroyMKey(mkey);
-            mem->complete();
+            dmaCommand->clearMemoryDescriptor();
+            dmaCommand->release();
             mem->release();
             return kIOReturnNoMemory;
         }
     } else {
         cmdDestroyMKey(mkey);
-        mem->complete();
+        dmaCommand->clearMemoryDescriptor();
+        dmaCommand->release();
         mem->release();
         return kIOReturnNoMemory;
     }
@@ -238,7 +284,10 @@ kern_return_t MlxMR::deregMR(uint32_t mrHandle)
                 fMrTable->getObject(i));
             if (ctx && ctx->mrHandle == mrHandle) {
                 if (ctx->fMemDesc) {
-                    ctx->fMemDesc->complete();
+                    if (ctx->fDmaCommand) {
+                        ctx->fDmaCommand->clearMemoryDescriptor();
+                        ctx->fDmaCommand->release();
+                    }
                     ctx->fMemDesc->release();
                 }
                 fMrTable->removeObject(i);

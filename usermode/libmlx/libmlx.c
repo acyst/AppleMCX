@@ -43,6 +43,9 @@ struct mlx_cq {
     struct MlxCqe64 *cqeBuf;   /* usermode CQ buffer */
     uint32_t    logSize;
     uint32_t    consIndex;
+    int         cqeMapped;
+    uint32_t   *dbRecord;
+    mach_vm_address_t dbMap;
 };
 
 struct mlx_qp {
@@ -56,11 +59,13 @@ struct mlx_qp {
     void       *uar;
     uint32_t    bfOffset;
     uint32_t   *dbRecord;      /* send DB record */
+    mach_vm_address_t dbMap;
     uint32_t    sqHead;        /* SQ software head */
     uint32_t    rqHead;
     uint32_t    state;
     uint64_t   *wrid;          /* wr_id corresponding to each completion */
     uint32_t    maxInline;
+    int         dbMapped;
 };
 
 struct mlx_mr {
@@ -184,6 +189,12 @@ mlx_context *mlx_open_device_by_name(const char *name)
         free(ctx);
         return NULL;
     }
+    mach_vm_address_t uar = 0;
+    mach_vm_size_t uarSize = 0;
+    kr = IOConnectMapMemory(ctx->conn, kMlxUCMemIndexUar, mach_task_self(),
+                            &uar, &uarSize, kIOMapAnywhere);
+    if (kr == kIOReturnSuccess && uar)
+        ctx->uarMap = (void *)(uintptr_t)uar;
     if (name)
         strncpy(ctx->devname, name, sizeof(ctx->devname) - 1);
 #else
@@ -236,6 +247,10 @@ void mlx_close_device(mlx_context *ctx)
     if (!ctx)
         return;
 #ifdef __APPLE__
+    if (ctx->uarMap)
+        IOConnectUnmapMemory(ctx->conn, kMlxUCMemIndexUar,
+                             mach_task_self(),
+                             (mach_vm_address_t)(uintptr_t)ctx->uarMap);
     if (ctx->conn)
         IOServiceClose(ctx->conn);
 #endif
@@ -293,21 +308,21 @@ mlx_cq *mlx_create_cq(mlx_context *ctx, uint32_t cqe, uint32_t *cqHandle)
     if (!cq)
         return NULL;
     cq->ctx = ctx;
-    cq->logSize = 0;
-    while ((1u << cq->logSize) < cqe && cq->logSize < 16)
-        cq->logSize++;
     cq->cqeBuf = NULL;
 
     /* Control path: create kernel CQ (with DMA CQE buffer) */
-    uint32_t input = cqe;
-    size_t outSize = 4;
+    struct mlx_create_cq_req req = { cqe };
+    struct mlx_create_cq_resp resp = {0};
+    size_t outSize = sizeof(resp);
     kern_return_t kr = IOConnectCallStructMethod(
-        ctx->conn, kMlxUCMethodCreateCQ, &input, 4, cqHandle, &outSize);
+        ctx->conn, kMlxUCMethodCreateCQ, &req, sizeof(req), &resp, &outSize);
     if (kr != kIOReturnSuccess) {
         free(cq);
         return NULL;
     }
-    cq->cqHandle = *cqHandle;
+    cq->cqHandle = resp.cqHandle;
+    cq->logSize = resp.logSize;
+    *cqHandle = resp.cqHandle;
 
     /* Zero-copy: map kernel CQE buffer (clientMemoryForType kMlxUCMemIndexCqe)
      * usermode polls hardware-written CQEs directly, no syscall */
@@ -318,13 +333,33 @@ mlx_cq *mlx_create_cq(mlx_context *ctx, uint32_t cqe, uint32_t *cqHandle)
                             &mapped, &mappedSize, kIOMapAnywhere);
     if (kr == kIOReturnSuccess && mapped) {
         cq->cqeBuf = (struct MlxCqe64 *)(uintptr_t)mapped;
+        cq->cqeMapped = 1;
     }
 #endif
     if (!cq->cqeBuf) {
-        /* Mapping failed fallback: local buffer */
-        cq->cqeBuf = (struct MlxCqe64 *)calloc(1u << cq->logSize,
-                                               sizeof(struct MlxCqe64));
+        IOConnectCallStructMethod(ctx->conn, kMlxUCMethodDestroyCQ,
+                                  &cq->cqHandle, 4, NULL, 0);
+        free(cq);
+        return NULL;
     }
+    mach_vm_address_t dbMap = 0;
+    mach_vm_size_t dbSize = 0;
+    kr = IOConnectMapMemory(ctx->conn, kMlxUCMemIndexDbRecord,
+                            mach_task_self(), &dbMap, &dbSize,
+                            kIOMapAnywhere);
+    if (kr != kIOReturnSuccess || !dbMap ||
+        resp.dbRecordOffset + 2 * sizeof(uint32_t) > dbSize) {
+        if (cq->cqeMapped)
+            IOConnectUnmapMemory(ctx->conn, kMlxUCMemIndexCqe,
+                                 mach_task_self(),
+                                 (mach_vm_address_t)(uintptr_t)cq->cqeBuf);
+        IOConnectCallStructMethod(ctx->conn, kMlxUCMethodDestroyCQ,
+                                  &cq->cqHandle, 4, NULL, 0);
+        free(cq);
+        return NULL;
+    }
+    cq->dbMap = dbMap;
+    cq->dbRecord = (uint32_t *)(uintptr_t)(dbMap + resp.dbRecordOffset);
     return cq;
 }
 
@@ -335,9 +370,12 @@ void mlx_destroy_cq(mlx_cq *cq)
     IOConnectCallStructMethod(cq->ctx->conn, kMlxUCMethodDestroyCQ,
                               &cq->cqHandle, 4, NULL, 0);
 #ifdef __APPLE__
-    if (cq->cqeBuf)
+    if (cq->cqeMapped)
         IOConnectUnmapMemory(cq->ctx->conn, kMlxUCMemIndexCqe,
                              mach_task_self(), (mach_vm_address_t)(uintptr_t)cq->cqeBuf);
+    if (cq->dbMap)
+        IOConnectUnmapMemory(cq->ctx->conn, kMlxUCMemIndexDbRecord,
+                             mach_task_self(), cq->dbMap);
 #endif
     free(cq);
 }
@@ -361,6 +399,7 @@ mlx_qp *mlx_create_qp(mlx_context *ctx, mlx_pd *pd, mlx_cq *sendCq,
     qp->sqSize = sqSize;
     qp->rqSize = rqSize;
     qp->state = 0;   /* RST */
+    qp->uar = ctx->uarMap;
     qp->maxInline = 0;
     qp->wrid = (uint64_t *)calloc(sqSize, sizeof(uint64_t));
     if (!qp->wrid) {
@@ -391,6 +430,7 @@ mlx_qp *mlx_create_qp(mlx_context *ctx, mlx_pd *pd, mlx_cq *sendCq,
         return NULL;
     }
     qp->qpn = resp.qpn;
+    qp->bfOffset = resp.bfOffset;
 
     /* Map DB record page (usermode post_send updates the queue head pointer)
      * See Linux uverbs mmap DB page */
@@ -399,9 +439,22 @@ mlx_qp *mlx_create_qp(mlx_context *ctx, mlx_pd *pd, mlx_cq *sendCq,
     mach_vm_size_t dbSize = 0;
     kr = IOConnectMapMemory(ctx->conn, kMlxUCMemIndexDbRecord, mach_task_self(),
                             &dbAddr, &dbSize, kIOMapAnywhere);
-    if (kr == kIOReturnSuccess && dbAddr)
-        qp->dbRecord = (uint32_t *)(uintptr_t)dbAddr;
+    if (kr == kIOReturnSuccess && dbAddr &&
+        resp.dbRecordOffset + 2 * sizeof(uint32_t) <= dbSize) {
+        qp->dbMap = dbAddr;
+        qp->dbRecord = (uint32_t *)(uintptr_t)(dbAddr +
+                                               resp.dbRecordOffset);
+    }
+    if (qp->dbRecord)
+        qp->dbMapped = 1;
 #endif
+    if (!qp->uar || !qp->dbRecord) {
+        IOConnectCallStructMethod(ctx->conn, kMlxUCMethodDestroyQP,
+                                  &qp->qpn, 4, NULL, 0);
+        free(qp->wrid);
+        free(qp);
+        return NULL;
+    }
     return qp;
 }
 
@@ -432,6 +485,12 @@ void mlx_destroy_qp(mlx_qp *qp)
         return;
     IOConnectCallStructMethod(qp->ctx->conn, kMlxUCMethodDestroyQP,
                               &qp->qpn, 4, NULL, 0);
+#ifdef __APPLE__
+    if (qp->dbMapped)
+        IOConnectUnmapMemory(qp->ctx->conn, kMlxUCMemIndexDbRecord,
+                             mach_task_self(),
+                             qp->dbMap);
+#endif
     free(qp->wrid);
     free(qp);
 }
@@ -526,14 +585,14 @@ void mlx_destroy_ah(mlx_ah *ah)
  */
 int mlx_post_send(mlx_qp *qp, const struct mlx_send_wr *wr)
 {
-    if (!qp || !wr)
+    if (!qp || !wr || !qp->uar || !qp->dbRecord)
         return EINVAL;
 
     /* Compute WQE size (ctrl 16B + data segments, 16B aligned) */
-    uint32_t numDseg = (wr->length + 15) / 16;
-    if (numDseg == 0)
-        numDseg = 1;
-    uint32_t wqeSize = (1 + numDseg) * 16;   /* ctrl + data segs */
+    uint32_t numDseg = 1;
+    uint32_t numExtra = (wr->wrType == MLX_WR_RDMA_WRITE ||
+                         wr->wrType == MLX_WR_RDMA_READ) ? 1 : 0;
+    uint32_t wqeSize = (1 + numExtra + numDseg) * 16;
     uint32_t wqeSize16 = wqeSize / 16;       /* in units of 16B */
 
     /* Get SQ slot */
@@ -562,14 +621,11 @@ int mlx_post_send(mlx_qp *qp, const struct mlx_send_wr *wr)
         off += 16;
     }
 
-    /* Data segment (addr = physical address, for hardware DMA) */
+    /* The MKey translates this registered user IOVA; do not expose a raw PA. */
     struct MlxWqeDataSeg *dseg = (struct MlxWqeDataSeg *)(wqe + off);
     dseg->byte_count = host_to_be32(wr->length);
     dseg->lkey = host_to_be32(wr->lkey);
-    /* DMA attach: virtual → physical address (pinned) */
-    uint64_t dataPhys = virt_to_phys(qp->ctx, (uint64_t)(uintptr_t)wr->data);
-    dseg->addr = host_to_be64(dataPhys ? dataPhys
-                                       : (uint64_t)(uintptr_t)wr->data);
+    dseg->addr = host_to_be64((uint64_t)(uintptr_t)wr->data);
 
     /* Record wr_id */
     qp->wrid[idx] = wr->wrId;
@@ -579,15 +635,13 @@ int mlx_post_send(mlx_qp *qp, const struct mlx_send_wr *wr)
     /* Update DB record */
     qp->sqHead++;
     if (qp->dbRecord)
-        *qp->dbRecord = qp->sqHead;
+        qp->dbRecord[1] = host_to_be32(qp->sqHead);
     mem_barrier();
 
     /* Ring doorbell (64-bit atomic) */
-    if (qp->uar) {
-        uint64_t dbVal = ((uint64_t)(qp->sqHead & 0xFFFF) << 32) |
-                         (uint64_t)qp->sqHead;
-        write_doorbell(dbVal, (uint8_t *)qp->uar + MLX_BF_OFFSET_USER);
-    }
+    uint64_t dbVal;
+    memcpy(&dbVal, ctrl, sizeof(dbVal));
+    write_doorbell(dbVal, (uint8_t *)qp->uar + qp->bfOffset);
     return 0;
 }
 
@@ -605,15 +659,12 @@ int mlx_post_recv(mlx_qp *qp, void *buf, uint32_t length, uint32_t lkey,
     struct MlxWqeDataSeg *dseg = (struct MlxWqeDataSeg *)wqe;
     dseg->byte_count = host_to_be32(length);
     dseg->lkey = host_to_be32(lkey);
-    /* DMA attach: receive buffer physical address */
-    uint64_t bufPhys = virt_to_phys(qp->ctx, (uint64_t)(uintptr_t)buf);
-    dseg->addr = host_to_be64(bufPhys ? bufPhys
-                                      : (uint64_t)(uintptr_t)buf);
+    dseg->addr = host_to_be64((uint64_t)(uintptr_t)buf);
 
     qp->rqHead++;
     mem_barrier();
     if (qp->dbRecord)
-        qp->dbRecord[1] = qp->rqHead;
+        qp->dbRecord[0] = host_to_be32(qp->rqHead);
     return 0;
 }
 
@@ -628,14 +679,19 @@ int mlx_poll_cq(mlx_cq *cq, struct MlxCqe64 *cqe, int num)
     int got = 0;
     for (int i = 0; i < num; i++) {
         struct MlxCqe64 *entry = &cq->cqeBuf[cq->consIndex & (size - 1)];
-        /* Owner bit: (op_own >> 1) & 1 (See MLX_CQE_OWNER_MASK) */
-        if (!(entry->op_own & MLX_CQE_OWNER_MASK))
+        uint8_t expectedOwner = (cq->consIndex >> cq->logSize) & 1;
+        if ((entry->op_own & 1) != expectedOwner ||
+            (entry->op_own >> 4) == 0x0f)
             break;
         mem_barrier();
         memcpy(&cqe[i], entry, sizeof(struct MlxCqe64));
-        /* Return ownership (clear the owner bit) */
-        entry->op_own &= ~MLX_CQE_OWNER_MASK;
+        cqe[i].wqe_counter = __builtin_bswap16(cqe[i].wqe_counter);
+        cqe[i].byte_cnt = __builtin_bswap32(cqe[i].byte_cnt);
+        cqe[i].flags_rqpn = __builtin_bswap32(cqe[i].flags_rqpn);
+        cqe[i].sop_drop_qpn = __builtin_bswap32(cqe[i].sop_drop_qpn);
         cq->consIndex++;
+        if (cq->dbRecord)
+            *cq->dbRecord = host_to_be32(cq->consIndex);
         got++;
     }
     return got;

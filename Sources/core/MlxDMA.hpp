@@ -21,12 +21,14 @@
  * DMA mapping result: physical segment list of user memory
  */
 struct MlxDMAReq {
+    task_t    ownerTask;        /* task that owns the virtual range */
     uint64_t  virtAddr;         /* user virtual address */
     uint64_t  length;           /* length */
     uint64_t  paList[MLX_DMA_MAX_SEGS];   /* physical segment list */
     uint64_t  paLenList[MLX_DMA_MAX_SEGS];/* physical length of each segment */
     uint32_t  numSegs;
     IOMemoryDescriptor *memDesc;          /* pinned memory descriptor */
+    IODMACommand *dmaCommand;             /* retained IOMMU mapping */
 };
 
 /*
@@ -37,6 +39,7 @@ class MlxDMA : public OSObject {
 
 public:
     bool init();
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* pin user memory → physical segment list
      * See MlxMR::buildPBL (mr.c) + ib_umem_get */
@@ -47,7 +50,7 @@ public:
     void unpinMemory(MlxDMAReq *req);
 
     /* Map physical address → user address lookup (for post_send) */
-    uint64_t lookupPhys(uint64_t virtAddr);
+    uint64_t lookupPhys(task_t ownerTask, uint64_t virtAddr);
 
 private:
     /* Get physical segments (IODMACommand, handles multiple segments) */

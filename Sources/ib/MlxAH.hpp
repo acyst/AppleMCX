@@ -32,6 +32,7 @@ class MlxAH : public OSObject {
 
 public:
     bool init(MlxRoCE *roce);
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* Create an AH: encode mlx5_av (see create_ib_ah, ah.c:53) */
     kern_return_t createAH(const struct mlx_create_ah_req *req,

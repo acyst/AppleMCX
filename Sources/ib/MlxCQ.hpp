@@ -26,6 +26,9 @@ struct MlxCQContext {
     uint64_t    cqeBufAddr;     /* virtual address */
     uint64_t    cqeDMA;         /* physical address */
     IOBufferMemoryDescriptor *cqeBufDesc;  /* buffer descriptor (held) */
+    IODMACommand *cqeDmaMap;               /* retained IOMMU mapping */
+    uint64_t    pageDMA[32];
+    uint32_t    numPages;
     uint32_t    dbRecordOffset;
     uint32_t    eqNumber;
     uint32_t    compVector;
@@ -45,8 +48,10 @@ class MlxCQ : public OSObject {
 
 public:
     bool init(MlxRoCE *roce);
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
-    kern_return_t createCQ(uint32_t cqeSize, uint32_t *cqHandle);
+    kern_return_t createCQ(uint32_t entries,
+                           struct mlx_create_cq_resp *resp);
     kern_return_t destroyCQ(uint32_t cqHandle);
 
     MlxCQContext *lookup(uint32_t cqHandle);

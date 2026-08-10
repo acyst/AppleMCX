@@ -17,6 +17,15 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxCC, OSObject)
 
+void MlxCC::free()
+{
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = NULL;
+    }
+    super::free();
+}
+
 bool MlxCC::init(MlxRoCE *roce)
 {
     if (!super::init())
@@ -32,7 +41,7 @@ bool MlxCC::init(MlxRoCE *roce)
     fParams.rpgAiRate = 5;           /* 5 Mbps */
     fParams.rpgTimeReset = 55;       /* 55 us */
     fParams.rpgThreshold = 150;      /* 150KB */
-    return true;
+    return fLock != NULL;
 }
 
 kern_return_t MlxCC::cmdQuery(uint32_t regId, void *out)

@@ -41,7 +41,7 @@ jobs:
 
       - name: Build userspace toolchain
         run: |
-          cd usermode/toolchain && make
+          make -C usermode/toolchain
 
       - name: Upload KEXT artifact
         uses: actions/upload-artifact@v4

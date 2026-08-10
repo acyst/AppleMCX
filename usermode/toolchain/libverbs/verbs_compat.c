@@ -11,6 +11,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <stdio.h>
 
 /* ---- Device list (multi-device support) ---- */
@@ -19,7 +20,6 @@
 static struct ibv_device *g_devices[MLX_MAX_DEVICES + 1] = { NULL };
 static struct ibv_device g_device_arr[MLX_MAX_DEVICES];
 static mlx_context *g_dev_ctx[MLX_MAX_DEVICES];   /* per-device libmlx ctx */
-static mlx_context *g_ctx_mlx = NULL;              /* currently active device ctx */
 static struct ibv_cq *g_last_cq = NULL;   /* most recently created CQ (for cq_event) */
 
 struct ibv_device **ibv_get_device_list(int *num_devices)
@@ -40,7 +40,6 @@ struct ibv_device **ibv_get_device_list(int *num_devices)
             strncpy(g_device_arr[0].name, "mlx5_0", IBV_SYSFS_NAME_MAX);
             strncpy(g_device_arr[0].dev_name, "mlx5_0", IBV_SYSFS_NAME_MAX);
             g_devices[0] = &g_device_arr[0];
-            g_ctx_mlx = ctx;
             if (num_devices)
                 *num_devices = 1;
             return g_devices;
@@ -60,7 +59,6 @@ struct ibv_device **ibv_get_device_list(int *num_devices)
         }
         g_devices[n] = NULL;   /* terminator */
         /* default active device = first one */
-        g_ctx_mlx = g_dev_ctx[0];
         if (num_devices)
             *num_devices = n;
     }
@@ -89,12 +87,16 @@ struct ibv_context *ibv_open_device(struct ibv_device *device)
     ctx->device = device;
     ctx->cmd_fd = 0;   /* MlxUserClient handle (managed via libmlx) */
 
-    /* Switch to this device's libmlx ctx (multi-device) */
+    /* Bind this verbs context to its enumerated device. */
     for (int i = 0; i < MLX_MAX_DEVICES; i++) {
         if (g_devices[i] == device && g_dev_ctx[i]) {
-            g_ctx_mlx = g_dev_ctx[i];
+            ctx->mlx_ctx = g_dev_ctx[i];
             break;
         }
+    }
+    if (!ctx->mlx_ctx) {
+        free(ctx);
+        return NULL;
     }
     return ctx;
 }
@@ -102,7 +104,6 @@ struct ibv_context *ibv_open_device(struct ibv_device *device)
 int ibv_close_device(struct ibv_context *context)
 {
     if (context) {
-        /* Keep g_ctx_mlx alive (single device); cleaned up at program exit */
         free(context);
     }
     return 0;
@@ -114,7 +115,7 @@ int ibv_query_device(struct ibv_context *context,
     if (!context || !device_attr)
         return -1;
     struct mlx_query_device_resp resp;
-    if (!g_ctx_mlx || mlx_query_device(g_ctx_mlx, &resp) != 0)
+    if (!context->mlx_ctx || mlx_query_device(context->mlx_ctx, &resp) != 0)
         return -1;
     memset(device_attr, 0, sizeof(*device_attr));
     device_attr->fw_ver = resp.fwVersion;
@@ -144,7 +145,7 @@ int ibv_query_port(struct ibv_context *context, uint8_t port_num,
     if (!context || !port_attr)
         return -1;
     struct mlx_query_port_resp resp;
-    if (!g_ctx_mlx || mlx_query_port(g_ctx_mlx, &resp) != 0)
+    if (!context->mlx_ctx || mlx_query_port(context->mlx_ctx, &resp) != 0)
         return -1;
     memset(port_attr, 0, sizeof(*port_attr));
     port_attr->state = resp.portState ? IBV_PORT_ACTIVE : IBV_PORT_DOWN;
@@ -173,20 +174,28 @@ struct ibv_pd *ibv_alloc_pd(struct ibv_context *context)
         return NULL;
     pd->context = context;
     pd->pd = 1;   /* MVP: device default PD */
+    pd->mlx_pd = mlx_alloc_pd(context->mlx_ctx);
+    if (!pd->mlx_pd) {
+        free(pd);
+        return NULL;
+    }
     return pd;
 }
 
 int ibv_dealloc_pd(struct ibv_pd *pd)
 {
-    (void)pd;
+    if (!pd)
+        return EINVAL;
+    mlx_dealloc_pd(pd->mlx_pd);
+    free(pd);
     return 0;
 }
 
 struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
                           int access)
 {
-    (void)pd;
-    if (!g_ctx_mlx || !addr)
+    if (!pd || !pd->context || !pd->context->mlx_ctx ||
+        !pd->mlx_pd || !addr)
         return NULL;
     /* Convert access flags to libmlx */
     uint32_t flags = 0;
@@ -194,13 +203,19 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
     if (access & IBV_ACCESS_REMOTE_WRITE) flags |= 0x8;
     if (access & IBV_ACCESS_REMOTE_READ) flags |= 0x4;
     struct mlx_reg_mr_resp resp;
-    struct mlx_pd *mlxPd = (struct mlx_pd *)pd;   /* userspace pd mapping */
-    if (!mlx_reg_mr(mlxPd, addr, length, flags, &resp))
+    struct mlx_mr *mlxMr = mlx_reg_mr(pd->mlx_pd, addr, length, flags, &resp);
+    if (!mlxMr)
         return NULL;
     struct ibv_mr *mr = (struct ibv_mr *)calloc(1, sizeof(*mr));
     if (mr) {
+        mr->pd = pd;
+        mr->addr = addr;
+        mr->length = length;
         mr->lkey = resp.lkey;
         mr->rkey = resp.rkey;
+        mr->mlx_mr = mlxMr;
+    } else {
+        mlx_dereg_mr(mlxMr);
     }
     return mr;
 }
@@ -208,7 +223,7 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 int ibv_dereg_mr(struct ibv_mr *mr)
 {
     if (mr) {
-        /* Released via libmlx */
+        mlx_dereg_mr(mr->mlx_mr);
         free(mr);
     }
     return 0;
@@ -233,9 +248,9 @@ struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
     cq->cqe = cqe;
 
     /* Create the real libmlx CQ (via MlxUserClient, includes DMA CQE buffer) */
-    if (g_ctx_mlx) {
+    if (context->mlx_ctx) {
         uint32_t cqHandle = 0;
-        mlx_cq *mlxCq = mlx_create_cq(g_ctx_mlx, cqe, &cqHandle);
+        mlx_cq *mlxCq = mlx_create_cq(context->mlx_ctx, cqe, &cqHandle);
         if (mlxCq) {
             cq->handle = cqHandle;
             cq->mlx_cq = mlxCq;
@@ -251,6 +266,8 @@ struct ibv_cq *ibv_create_cq(struct ibv_context *context, int cqe,
 int ibv_destroy_cq(struct ibv_cq *cq)
 {
     if (cq) {
+        if (g_last_cq == cq)
+            g_last_cq = NULL;
         if (cq->mlx_cq)
             mlx_destroy_cq(cq->mlx_cq);
         free(cq);
@@ -263,12 +280,12 @@ int ibv_destroy_cq(struct ibv_cq *cq)
 struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
                              struct ibv_qp_init_attr *qp_init_attr)
 {
-    if (!g_ctx_mlx || !qp_init_attr)
+    if (!pd || !pd->context || !pd->context->mlx_ctx || !qp_init_attr)
         return NULL;
     struct ibv_qp *qp = (struct ibv_qp *)calloc(1, sizeof(*qp));
     if (!qp)
         return NULL;
-    qp->context = NULL;   /* managed via libmlx global context */
+    qp->context = pd->context;
     qp->qp_type = qp_init_attr->qp_type;
     qp->send_cq = qp_init_attr->send_cq;
     qp->recv_cq = qp_init_attr->recv_cq;
@@ -281,9 +298,20 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
     if (sqSize == 0) sqSize = 128;
     if (rqSize == 0) rqSize = 128;
 
-    qp->sq_buf = calloc(sqSize, 64);
-    qp->rq_buf = calloc(rqSize, 64);
-    if (!qp->sq_buf || !qp->rq_buf) {
+    if (sqSize < 64) sqSize = 64;
+    if (rqSize < 64) rqSize = 64;
+    if (sqSize & (sqSize - 1)) {
+        uint32_t value = 1;
+        while (value < sqSize) value <<= 1;
+        sqSize = value;
+    }
+    if (rqSize & (rqSize - 1)) {
+        uint32_t value = 1;
+        while (value < rqSize) value <<= 1;
+        rqSize = value;
+    }
+    if (posix_memalign(&qp->sq_buf, 4096, (size_t)sqSize * 64) != 0 ||
+        posix_memalign(&qp->rq_buf, 4096, (size_t)rqSize * 64) != 0) {
         free(qp->sq_buf);
         free(qp->rq_buf);
         free(qp);
@@ -292,9 +320,12 @@ struct ibv_qp *ibv_create_qp(struct ibv_pd *pd,
 
     /* Create the real libmlx QP (via MlxUserClient)
      * CQ association: use send_cq's libmlx handle */
-    uint32_t cqHandle = qp_init_attr->send_cq ?
-                        ((struct ibv_cq *)qp_init_attr->send_cq)->handle : 0;
-    qp->mlx_qp = mlx_create_qp(g_ctx_mlx, NULL, NULL, NULL,
+    mlx_cq *send_cq = qp_init_attr->send_cq ?
+        ((struct ibv_cq *)qp_init_attr->send_cq)->mlx_cq : NULL;
+    mlx_cq *recv_cq = qp_init_attr->recv_cq ?
+        ((struct ibv_cq *)qp_init_attr->recv_cq)->mlx_cq : send_cq;
+    qp->mlx_qp = mlx_create_qp(pd->context->mlx_ctx, pd->mlx_pd,
+                               send_cq, recv_cq,
                                (qp_init_attr->qp_type == IBV_QPT_RC) ? 0 : 1,
                                sqSize, rqSize, qp->sq_buf, qp->rq_buf);
     if (!qp->mlx_qp) {
@@ -312,16 +343,16 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
     if (!qp || !attr)
         return -1;
     (void)attr_mask;
-    qp->state = attr->qp_state;
+    int old_state = qp->state;
 
     /* State machine driven via libmlx (RST->INIT->RTR->RTS) */
     if (qp->mlx_qp) {
         struct mlx_modify_qp_req req;
         memset(&req, 0, sizeof(req));
         /* curState: inferred from the previous qp->state (MVP: sequential calls) */
-        uint32_t cur = (qp->state == IBV_QPS_RESET) ? 0 :
-                       (qp->state == IBV_QPS_INIT) ? 1 :
-                       (qp->state == IBV_QPS_RTR) ? 2 : 3;
+        uint32_t cur = (old_state == IBV_QPS_RESET) ? 0 :
+                       (old_state == IBV_QPS_INIT) ? 1 :
+                       (old_state == IBV_QPS_RTR) ? 2 : 3;
         req.curState = cur;
         req.newState = attr->qp_state;
         req.destQpn = attr->dest_qp_num;
@@ -341,8 +372,11 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
             req.ahTrafficClass = attr->ah_attr.grh.traffic_class;
             req.ahUdpSport = 0;   /* default assigned by kernel */
         }
-        mlx_modify_qp(qp->mlx_qp, cur, attr->qp_state, &req);
+        int rc = mlx_modify_qp(qp->mlx_qp, cur, attr->qp_state, &req);
+        if (rc)
+            return rc;
     }
+    qp->state = attr->qp_state;
     return 0;
 }
 
@@ -369,7 +403,7 @@ int ibv_query_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 
 struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 {
-    if (!g_ctx_mlx || !attr)
+    if (!pd || !pd->context || !pd->context->mlx_ctx || !attr)
         return NULL;
     struct ibv_ah *ah = (struct ibv_ah *)calloc(1, sizeof(*ah));
     if (ah) {
@@ -411,9 +445,15 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
             mwr.rkey = w->wr.rdma.rkey;
             break;
         case IBV_WR_SEND:
-        default:
             mwr.wrType = MLX_WR_SEND;
             break;
+        default:
+            if (bad_wr) *bad_wr = w;
+            return EOPNOTSUPP;
+        }
+        if (w->num_sge > 1) {
+            if (bad_wr) *bad_wr = w;
+            return EOPNOTSUPP;
         }
         if (w->sg_list && w->num_sge > 0) {
             mwr.data = (void *)(uintptr_t)w->sg_list[0].addr;
@@ -425,7 +465,14 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
         /* libmlx data path (MVP: userland writes SQ directly + doorbell)
          * Full: requires a valid qp->mlx_qp, fallback recorded here */
         if (qp->mlx_qp) {
-            mlx_post_send(qp->mlx_qp, &mwr);
+            int kr = mlx_post_send(qp->mlx_qp, &mwr);
+            if (kr) {
+                if (bad_wr) *bad_wr = w;
+                return kr;
+            }
+        } else {
+            if (bad_wr) *bad_wr = w;
+            return ENODEV;
         }
     }
     return 0;
@@ -439,13 +486,21 @@ int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
         return -1;
     }
     for (struct ibv_recv_wr *w = wr; w; w = w->next) {
+        if (w->num_sge != 1 || !w->sg_list || !qp->mlx_qp) {
+            if (bad_wr) *bad_wr = w;
+            return EOPNOTSUPP;
+        }
         if (w->sg_list && w->num_sge > 0) {
             struct ibv_sge *sge = &w->sg_list[0];
             /* libmlx receive path (MVP) */
             if (qp->mlx_qp) {
-                mlx_post_recv(qp->mlx_qp,
+                int kr = mlx_post_recv(qp->mlx_qp,
                               (void *)(uintptr_t)sge->addr,
                               sge->length, sge->lkey, w->wr_id);
+                if (kr) {
+                    if (bad_wr) *bad_wr = w;
+                    return kr;
+                }
             }
         }
     }
@@ -464,9 +519,12 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
         for (int i = 0; i < got; i++) {
             memset(&wc[i], 0, sizeof(wc[i]));
             wc[i].wr_id = cqes[i].wqe_counter;   /* MVP: simplified wr_id */
-            wc[i].status = IBV_WC_SUCCESS;
+            uint8_t opcode = cqes[i].op_own >> 4;
+            wc[i].status = (opcode == 0x0d || opcode == 0x0e ||
+                            opcode == 0x0c) ? IBV_WC_GENERAL_ERR :
+                                               IBV_WC_SUCCESS;
             wc[i].byte_len = cqes[i].byte_cnt;
-            wc[i].qp_num = (cqes[i].flags_rqpn >> 8) & 0xFFFFFF;
+            wc[i].qp_num = cqes[i].sop_drop_qpn & 0xFFFFFF;
         }
         return got;
     }
@@ -536,9 +594,9 @@ int ibv_get_async_event(struct ibv_context *context,
     if (!context || !event)
         return -1;
     /* Fetch async events via libmlx (non-blocking) */
-    if (g_ctx_mlx) {
+    if (context->mlx_ctx) {
         struct mlx_async_event mev;
-        if (mlx_get_async_event(g_ctx_mlx, &mev) == 0) {
+        if (mlx_get_async_event(context->mlx_ctx, &mev) == 0) {
             memset(event, 0, sizeof(*event));
             event->event_type = (enum ibv_event_type)mev.eventType;
             switch (mev.elementType) {
@@ -573,7 +631,14 @@ int ibv_get_cq_event(struct ibv_comp_channel *channel,
         return -1;
     /* Query completion count via MlxUserClient (MVP: returns the most recently created CQ)
      * Full: blocks until a new completion, see ibv_get_cq_event semantics */
-    if (g_ctx_mlx && g_last_cq) {
+    if (g_last_cq && g_last_cq->context == channel->context &&
+        channel->context->mlx_ctx) {
+        uint64_t count = 0;
+        if (mlx_query_cq_completions(channel->context->mlx_ctx,
+                                     g_last_cq->handle, &count) != 0 ||
+            count == g_last_cq->event_count)
+            return -1;
+        g_last_cq->event_count = count;
         *cq = g_last_cq;
         if (cq_context)
             *cq_context = (*cq)->cq_context;

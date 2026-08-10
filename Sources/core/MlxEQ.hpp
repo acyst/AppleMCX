@@ -12,12 +12,14 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
 #include "MlxRegs.hpp"
 
 #define MLX_EVENT_TYPE_MAX      64
 #define MLX_NUM_ASYNC_EQS       3       /* cmd/async/pages */
 #define MLX_NUM_SPARE_EQE       128     /* number of spare EQEs (See eq.h:35) */
 #define MLX_MAX_EVENT_NOTIFIERS 4
+#define MLX_MAX_EQ_PAGES        32
 
 class MlxPCIDriver;
 
@@ -59,8 +61,13 @@ struct MlxEqEntry {
     uint32_t     doorbellOffset; /* UAR + MLX_EQ_DOORBELL */
     uint32_t     irqVector;
     IOBufferMemoryDescriptor *fDesc;  /* ring buffer memory descriptor */
+    IODMACommand *fDmaMap;      /* retained IOMMU mapping */
+    uint64_t     pageDMA[MLX_MAX_EQ_PAGES];
+    uint32_t     numPages;
     uint32_t     eventMask[4];  /* event mask (128-bit) */
 };
+
+static_assert(sizeof(MlxEqe) == 64, "mlx5 EQE must be 64 bytes");
 
 /*
  * Event queue management class
@@ -77,16 +84,18 @@ public:
 
     /* Register MSI-X interrupts (IOInterruptEventSource) */
     kern_return_t setupInterrupts();
+    void shutdown();
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* Subscribe to events (register for a specific type) */
     void registerNotifier(uint32_t eventType, MlxEventNotifier *n);
     void unregisterNotifier(uint32_t eventType, MlxEventNotifier *n);
 
     /* Interrupt handler entry points */
-    static void asyncIntrHandler(OSObject *target, void *refCon,
-                                 IOService *nub, int source);
-    static void compIntrHandler(OSObject *target, void *refCon,
-                                IOService *nub, int source);
+    static void asyncIntrHandler(OSObject *owner,
+                                 IOInterruptEventSource *sender, int count);
+    static void compIntrHandler(OSObject *owner,
+                                IOInterruptEventSource *sender, int count);
 
     /* Completion EQ number for CQ binding */
     uint32_t getCompEqNumber(uint32_t vector) const

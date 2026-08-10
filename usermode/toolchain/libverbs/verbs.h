@@ -22,6 +22,7 @@
 /* libmlx forward declarations (full definitions provided by libmlx.h) */
 struct mlx_qp;
 struct mlx_context;
+struct mlx_pd;
 
 /* ---- Basic types ---- */
 typedef uint32_t uint32_be_t;
@@ -279,6 +280,7 @@ struct ibv_pd {
     struct ibv_context *context;
     uint32_t handle;
     uint32_t pd;              /* maps to libmlx mlx_pd */
+    struct mlx_pd *mlx_pd;
 };
 
 struct ibv_mr {
@@ -289,6 +291,7 @@ struct ibv_mr {
     uint32_t handle;
     uint32_t lkey;
     uint32_t rkey;
+    struct mlx_mr *mlx_mr;
 };
 
 struct ibv_cq {
@@ -301,6 +304,7 @@ struct ibv_cq {
     uint32_t cons_index;
     /* libmlx mapping */
     struct mlx_cq *mlx_cq;
+    uint64_t event_count;
 };
 
 struct ibv_qp {
@@ -339,6 +343,7 @@ struct ibv_device {
 struct ibv_context {
     struct ibv_device *device;
     int cmd_fd;                 /* maps to the MlxUserClient connection */
+    struct mlx_context *mlx_ctx;
 };
 
 struct ibv_device_attr {

@@ -64,6 +64,7 @@ class MlxQP : public OSObject {
 
 public:
     bool init(MlxRoCE *roce);
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     kern_return_t createQP(const struct mlx_create_qp_req *req,
                            struct mlx_create_qp_resp *resp);

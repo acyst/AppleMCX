@@ -15,10 +15,11 @@ CC          := $(shell xcrun -sdk macosx -find clang)
 
 # ---- 源文件 ----
 SRC_CORE   := $(wildcard Sources/core/*.cpp)
+SRC_HW     := $(wildcard Sources/hw/*.cpp)
 SRC_IB     := $(wildcard Sources/ib/*.cpp)
 SRC_NETIF  := $(wildcard Sources/netif/*.cpp)
 SRC_UC     := $(wildcard Sources/userclient/*.cpp)
-SRC        := $(SRC_CORE) $(SRC_IB) $(SRC_NETIF) $(SRC_UC)
+SRC        := $(SRC_CORE) $(SRC_HW) $(SRC_IB) $(SRC_NETIF) $(SRC_UC)
 OBJ        := $(patsubst Sources/%,obj/%,$(SRC:.cpp=.o))
 
 # ---- 编译标志 ----

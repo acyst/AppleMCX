@@ -21,15 +21,18 @@
 
 class MlxHCAConnectX5 : public MlxHCA {
 public:
-    MlxHCAConnectX5() : fCore(NULL), fLoaded(false) {}
+    MlxHCAConnectX5() : fCore(NULL), fLoaded(false), fCaps{}, fVendor{} {}
 
     virtual ~MlxHCAConnectX5() {}
 
     /* Bind the core driver (the loader only dispatches; core is set in the start phase) */
-    void attachCore(MlxPCIDriver *core) { fCore = core; }
+    virtual void attachCore(MlxPCIDriver *core) APPLE_KEXT_OVERRIDE
+    { fCore = core; }
 
     virtual const MlxHcaCaps &caps() const APPLE_KEXT_OVERRIDE { return fCaps; }
     virtual const MlxVendorInfo &vendor() const APPLE_KEXT_OVERRIDE { return fVendor; }
+    virtual MlxHcaCaps &mutableCaps() APPLE_KEXT_OVERRIDE { return fCaps; }
+    virtual MlxVendorInfo &mutableVendor() APPLE_KEXT_OVERRIDE { return fVendor; }
 
     virtual kern_return_t exec(uint32_t opcode, const void *in,
                                uint32_t inSize, void *out,
@@ -67,15 +70,6 @@ private:
 };
 
 /* ---- Factory: model dispatch ---- */
-
-/* Exported bind function (used by MlxPCIDriver, keeps HCA implementation details private) */
-extern "C" void
-mlx_hca_attach_core(MlxHCA *hca, MlxPCIDriver *core)
-{
-    MlxHCAConnectX5 *cx5 = dynamic_cast<MlxHCAConnectX5 *>(hca);
-    if (cx5)
-        cx5->attachCore(core);
-}
 
 MlxHCA *MlxHCALoader::create(uint16_t deviceId)
 {

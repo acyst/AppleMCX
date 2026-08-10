@@ -42,6 +42,8 @@ bool MlxEthRing::init(uint32_t size, uint32_t wqebbSize)
     fHead = 0;
     fTail = 0;
     fWqBuf = NULL;
+    fWqDesc = NULL;
+    fWqDmaMap = NULL;
     fDbRecord = NULL;
     return true;
 }
@@ -60,21 +62,22 @@ kern_return_t MlxEthRing::allocBuffers()
         kernel_task, kIODirectionInOut, wqBytes, 0xFFFFFFF000ULL);
     if (!fWqDesc)
         return kIOReturnNoMemory;
-    if (fWqDesc->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+    memset(fWqDesc->getBytesNoCopy(), 0, wqBytes);
+    fWqBuf = fWqDesc->getBytesNoCopy();
+    if (mlxMapDMAContiguous(fWqDesc, &fWqDmaMap, &fWqDMA) !=
+        kIOReturnSuccess) {
         fWqDesc->release();
         fWqDesc = NULL;
         return kIOReturnNoMemory;
     }
-    memset(fWqDesc->getBytesNoCopy(), 0, wqBytes);
-    fWqBuf = fWqDesc->getBytesNoCopy();
-    fWqDMA = fWqDesc->getPhysicalSegment(0, 0);
     return kIOReturnSuccess;
 }
 
 void MlxEthRing::freeBuffers()
 {
     if (fWqDesc) {
-        fWqDesc->complete();
+        mlxUnmapDMA(fWqDmaMap);
+        fWqDmaMap = NULL;
         fWqDesc->release();
         fWqDesc = NULL;
         fWqBuf = NULL;
@@ -163,14 +166,7 @@ bool MlxEthernet::start(IOService *provider)
 
 void MlxEthernet::stop(IOService *provider)
 {
-    if (fNetif) {
-        fNetif->release();
-        fNetif = NULL;
-    }
-    if (fNic) {
-        fNic->release();
-        fNic = NULL;
-    }
+    destroyInterface();
     if (fTxRing) {
         fTxRing->release();
         fTxRing = NULL;
@@ -221,14 +217,16 @@ void MlxEthernet::destroyInterface()
         fNic->unregisterInterface();
         fNic->release();
         fNic = NULL;
+        fNetif = NULL;
     }
 }
 
 IOReturn MlxEthernet::enable(IONetworkInterface *netif)
 {
-    fEnabled = true;
-    setLinkState(true, 10000);    /* MVP: default 10GbE simulation */
-    return kIOReturnSuccess;
+    (void)netif;
+    fEnabled = false;
+    setLinkState(false, 0);
+    return kIOReturnUnsupported;
 }
 
 IOReturn MlxEthernet::disable(IONetworkInterface *netif)
@@ -292,6 +290,11 @@ UInt32 MlxEthernet::outputPacket(mbuf_t packet, void *param)
 
 kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
 {
+    /* No safe ownership transfer exists until SQ/TIS/CQ completion support is
+     * implemented. Keep the unfinished Ethernet data path disabled. */
+    (void)packet;
+    return kIOReturnUnsupported;
+#if 0
     /* See mlx5e_xmit (en_tx.c:666) + mlx5e_sq_xmit_wqe:
      * WQE = ctrl(16B) + eth(16B) + data seg (DMA)
      * Write to the SQ ring buffer → update the DB record → ring the doorbell */
@@ -349,6 +352,7 @@ kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
     /* Free the mbuf (data is referenced by DMA; MVP frees it immediately) */
     mbuf_freem(packet);
     return kIOReturnSuccess;
+#endif
 }
 
 kern_return_t MlxEthernet::xmitInline(mbuf_t packet)

@@ -22,6 +22,7 @@ class MlxCC : public OSObject {
 
 public:
     bool init(MlxRoCE *roce);
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* See core/port.c:900 mlx5_set_roce_cc_param */
     kern_return_t queryParams(struct mlx_cc_params *out);

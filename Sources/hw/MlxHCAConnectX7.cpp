@@ -22,14 +22,17 @@
 
 class MlxHCAConnectX7 : public MlxHCA {
 public:
-    MlxHCAConnectX7() : fCore(NULL), fLoaded(false) {}
+    MlxHCAConnectX7() : fCore(NULL), fLoaded(false), fCaps{}, fVendor{} {}
 
     virtual ~MlxHCAConnectX7() {}
 
-    void attachCore(MlxPCIDriver *core) { fCore = core; }
+    virtual void attachCore(MlxPCIDriver *core) APPLE_KEXT_OVERRIDE
+    { fCore = core; }
 
     virtual const MlxHcaCaps &caps() const APPLE_KEXT_OVERRIDE { return fCaps; }
     virtual const MlxVendorInfo &vendor() const APPLE_KEXT_OVERRIDE { return fVendor; }
+    virtual MlxHcaCaps &mutableCaps() APPLE_KEXT_OVERRIDE { return fCaps; }
+    virtual MlxVendorInfo &mutableVendor() APPLE_KEXT_OVERRIDE { return fVendor; }
 
     virtual kern_return_t exec(uint32_t opcode, const void *in,
                                uint32_t inSize, void *out,
@@ -82,13 +85,4 @@ MlxHCA *MlxHCALoader::createCx7(uint16_t deviceId)
     default:
         return NULL;
     }
-}
-
-/* Exported bind function (used by MlxPCIDriver) */
-extern "C" void
-mlx_hca_attach_core_cx7(MlxHCA *hca, MlxPCIDriver *core)
-{
-    MlxHCAConnectX7 *cx7 = dynamic_cast<MlxHCAConnectX7 *>(hca);
-    if (cx7)
-        cx7->attachCore(core);
 }

@@ -8,6 +8,7 @@
 #define MLX_ROCE_HPP
 
 #include <IOKit/IOService.h>
+#include <IOKit/IOUserClient.h>
 #include "MlxHCA.hpp"
 #include "MlxWQE.hpp"
 #include "MlxEQ.hpp"
@@ -34,13 +35,17 @@ public:
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
     virtual void free() APPLE_KEXT_OVERRIDE;
+    virtual IOReturn newUserClient(task_t owningTask, void *securityID,
+                                   UInt32 type, OSDictionary *properties,
+                                   IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 
     /* ---- verbs operations (called by MlxUserClient) ---- */
     kern_return_t createQP(const struct mlx_create_qp_req *req,
                            struct mlx_create_qp_resp *resp);
     kern_return_t modifyQP(const struct mlx_modify_qp_req *req);
     kern_return_t destroyQP(uint32_t qpn);
-    kern_return_t createCQ(uint32_t cqeSize, uint32_t *cqHandle);
+    kern_return_t createCQ(uint32_t entries,
+                           struct mlx_create_cq_resp *resp);
     kern_return_t destroyCQ(uint32_t cqHandle);
     kern_return_t regMR(const struct mlx_reg_mr_req *req,
                         struct mlx_reg_mr_resp *resp);

@@ -16,6 +16,7 @@
 #include "MlxCC.hpp"
 #include "MlxRegs.hpp"
 #include "MlxWQE.hpp"
+#include "MlxUserClient.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -23,6 +24,26 @@
 
 #define super IOService
 OSDefineMetaClassAndStructors(MlxRoCE, IOService)
+
+IOReturn MlxRoCE::newUserClient(task_t owningTask, void *securityID,
+                                UInt32 type, OSDictionary *properties,
+                                IOUserClient **handler)
+{
+    if (!handler || type != 0)
+        return kIOReturnBadArgument;
+    *handler = NULL;
+    MlxUserClient *client = OSTypeAlloc(MlxUserClient);
+    if (!client)
+        return kIOReturnNoMemory;
+    if (!client->initWithTask(owningTask, securityID, type, properties) ||
+        !client->attach(this) || !client->start(this)) {
+        client->detach(this);
+        client->release();
+        return kIOReturnNotPrivileged;
+    }
+    *handler = client;
+    return kIOReturnSuccess;
+}
 
 bool MlxRoCE::init(OSDictionary *properties)
 {
@@ -90,19 +111,30 @@ void MlxRoCE::stop(IOService *provider)
         eq->unregisterNotifier(MLX_EVENT_TYPE_GID_CHANGE, this);
         eq->unregisterNotifier(MLX_EVENT_TYPE_CLIENT_REREGISTER, this);
     }
-    if (fGID) { fGID->release(); fGID = NULL; }
-    if (fCC) { fCC->release(); fCC = NULL; }
-    if (fAH) { fAH->release(); fAH = NULL; }
-    if (fMR) { fMR->release(); fMR = NULL; }
-    if (fCQ) { fCQ->release(); fCQ = NULL; }
     if (fQP) { fQP->release(); fQP = NULL; }
+    if (fCQ) { fCQ->release(); fCQ = NULL; }
+    if (fMR) { fMR->release(); fMR = NULL; }
+    if (fAH) { fAH->release(); fAH = NULL; }
+    if (fCC) { fCC->release(); fCC = NULL; }
+    if (fGID) { fGID->release(); fGID = NULL; }
     if (fResourceLock) { IOLockFree(fResourceLock); fResourceLock = NULL; }
+    if (fEventLock) { IOLockFree(fEventLock); fEventLock = NULL; }
+    if (fQpTable) { fQpTable->release(); fQpTable = NULL; }
+    if (fCqTable) { fCqTable->release(); fCqTable = NULL; }
+    if (fMrTable) { fMrTable->release(); fMrTable = NULL; }
+    if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     if (fCore) { fCore->release(); fCore = NULL; }
     super::stop(provider);
 }
 
 void MlxRoCE::free()
 {
+    if (fQpTable) { fQpTable->release(); fQpTable = NULL; }
+    if (fCqTable) { fCqTable->release(); fCqTable = NULL; }
+    if (fMrTable) { fMrTable->release(); fMrTable = NULL; }
+    if (fEventLock) { IOLockFree(fEventLock); fEventLock = NULL; }
+    if (fResourceLock) { IOLockFree(fResourceLock); fResourceLock = NULL; }
+    if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     super::free();
 }
 
@@ -292,9 +324,10 @@ kern_return_t MlxRoCE::destroyQP(uint32_t qpn)
     return fQP->destroyQP(qpn);
 }
 
-kern_return_t MlxRoCE::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
+kern_return_t MlxRoCE::createCQ(uint32_t entries,
+                                struct mlx_create_cq_resp *resp)
 {
-    return fCQ->createCQ(cqeSize, cqHandle);
+    return fCQ->createCQ(entries, resp);
 }
 
 kern_return_t MlxRoCE::destroyCQ(uint32_t cqHandle)

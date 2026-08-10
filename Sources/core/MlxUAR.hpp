@@ -12,6 +12,7 @@
 #include <libkern/OSTypes.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
 #include "MlxRegs.hpp"
 
 class MlxPCIDriver;
@@ -42,6 +43,7 @@ class MlxUAR : public OSObject {
 
 public:
     bool init(MlxPCIDriver *owner);
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* Allocate a UAR page (See mlx5_get_uars_page, uar.c:165) */
     kern_return_t allocUar(MlxUarAlloc *uar);
@@ -53,6 +55,7 @@ public:
 
     /* For user-space mapping */
     IOMemoryDescriptor *getUarMemDesc() { return fUarMemDesc; }
+    IOMemoryMap *getUarMap() { return fUarMap; }
 
     /* boot UAR index (used for EQ/CQ uar_page, See priv->uar->index) */
     uint32_t getBootUarIndex() const { return fBootIndex; }
@@ -64,6 +67,8 @@ public:
     uint32_t *getDbRecord() const { return fDbRecord; }
     uint64_t getDbRecordDMA() const { return fDbRecordDMA; }
     IOMemoryDescriptor *getDbMemDesc() { return fDbMemDesc; }
+    kern_return_t allocDbSlots(uint32_t count, uint32_t *offset);
+    void freeDbSlots(uint32_t offset, uint32_t count);
 
 private:
     /* Issue the ALLOC_UAR command (See uar.c:38 mlx5_cmd_alloc_uar) */
@@ -79,9 +84,14 @@ private:
     IOMemoryMap        *fUarMap;
     uint32_t    fUarBitmap;      /* BF allocation bitmap */
     uint32_t    fBootIndex;      /* boot UAR index */
+    MlxUarAlloc fBootUar;
+    bool        fBootUarValid;
     uint32_t   *fDbRecord;       /* DB record page */
     uint64_t    fDbRecordDMA;
     IOBufferMemoryDescriptor *fDbMemDesc;
+    IODMACommand *fDbDmaMap;
+    uint64_t    fDbBitmap[2];
+    IOLock     *fDbLock;
 };
 
 #endif /* MLX_UAR_HPP */

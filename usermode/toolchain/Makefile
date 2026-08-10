@@ -1,5 +1,6 @@
-# 工具链构建 — 迁移自 MLNX_OFED 用户态工具 (macOS)
-# 位于 usermode/toolchain/
+# Toolchain build for the macOS userspace utilities.
+
+ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 
 CC      ?= clang
 CXX     ?= clang++
@@ -8,21 +9,21 @@ HOST_ARCH := $(shell uname -m)
 ARCH      ?= $(if $(filter arm64, $(HOST_ARCH)), arm64, x86_64)
 SDK       := $(shell xcrun --sdk macosx --show-sdk-path)
 
-INC      = -Iusermode/toolchain/libmft \
-           -Iusermode/toolchain/libverbs \
-           -Iusermode/toolchain/perftest \
-           -Iusermode/libmlx \
-           -ISources/userclient \
-           -ISources/hw
+INC      = -I$(ROOT)/usermode/toolchain/libmft \
+           -I$(ROOT)/usermode/toolchain/libverbs \
+           -I$(ROOT)/usermode/toolchain/perftest \
+           -I$(ROOT)/usermode/libmlx \
+           -I$(ROOT)/Sources/userclient \
+           -I$(ROOT)/Sources/hw
 
 # 用户态编译: 用系统 SDK 头 (IOKit.framework), 不需内核 SDK
-CFLAGS  := -O2 -Wall -Wno-unused-parameter -arch $(ARCH) \
+CFLAGS  := -O2 -Wall -Wno-unused-parameter -arch $(strip $(ARCH)) \
            -mmacosx-version-min=13.0 $(INC)
 
 # ---- 库 ----
-LIBMLX   = usermode/libmlx/libmlx.c
-LIBMFT   = usermode/toolchain/libmft/libmft.c
-LIBVERBS = usermode/toolchain/libverbs/verbs_compat.c
+LIBMLX   = $(ROOT)/usermode/libmlx/libmlx.c
+LIBMFT   = $(ROOT)/usermode/toolchain/libmft/libmft.c
+LIBVERBS = $(ROOT)/usermode/toolchain/libverbs/verbs_compat.c
 
 # ---- 工具 ----
 TOOLS = ibv_devinfo ib_write_bw ib_send_bw ib_read_bw \
@@ -34,56 +35,56 @@ TOOLS = ibv_devinfo ib_write_bw ib_send_bw ib_read_bw \
 all: $(TOOLS)
 
 # ibv_devinfo (基于 libmlx)
-ibv_devinfo: usermode/tests/ibv_devinfo.c $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/tests/ibv_devinfo.c $(LIBMLX) \
+ibv_devinfo: $(ROOT)/usermode/tests/ibv_devinfo.c $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/tests/ibv_devinfo.c $(LIBMLX) \
 	    -framework IOKit -o $@
 
 # perftest 系 (基于 verbs 兼容层 + libmlx)
-ib_write_bw: usermode/toolchain/perftest/ib_write_bw.c $(LIBVERBS) $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/toolchain/perftest/ib_write_bw.c \
+ib_write_bw: $(ROOT)/usermode/toolchain/perftest/ib_write_bw.c $(LIBVERBS) $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/perftest/ib_write_bw.c \
 	    $(LIBVERBS) $(LIBMLX) -framework IOKit -o $@
 
-ib_send_bw: usermode/toolchain/perftest/ib_send_bw.c $(LIBVERBS) $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/toolchain/perftest/ib_send_bw.c \
+ib_send_bw: $(ROOT)/usermode/toolchain/perftest/ib_send_bw.c $(LIBVERBS) $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/perftest/ib_send_bw.c \
 	    $(LIBVERBS) $(LIBMLX) -framework IOKit -o $@
 
-ib_read_bw: usermode/toolchain/perftest/ib_read_bw.c $(LIBVERBS) $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/toolchain/perftest/ib_read_bw.c \
+ib_read_bw: $(ROOT)/usermode/toolchain/perftest/ib_read_bw.c $(LIBVERBS) $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/perftest/ib_read_bw.c \
 	    $(LIBVERBS) $(LIBMLX) -framework IOKit -o $@
 
 # 延迟测试 (基于 verbs 兼容层 + libmlx)
-ib_write_lat: usermode/toolchain/perftest/ib_write_lat.c $(LIBVERBS) $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/toolchain/perftest/ib_write_lat.c \
+ib_write_lat: $(ROOT)/usermode/toolchain/perftest/ib_write_lat.c $(LIBVERBS) $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/perftest/ib_write_lat.c \
 	    $(LIBVERBS) $(LIBMLX) -framework IOKit -o $@
 
-ib_send_lat: usermode/toolchain/perftest/ib_send_lat.c $(LIBVERBS) $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/toolchain/perftest/ib_send_lat.c \
+ib_send_lat: $(ROOT)/usermode/toolchain/perftest/ib_send_lat.c $(LIBVERBS) $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/perftest/ib_send_lat.c \
 	    $(LIBVERBS) $(LIBMLX) -framework IOKit -o $@
 
-ib_read_lat: usermode/toolchain/perftest/ib_read_lat.c $(LIBVERBS) $(LIBMLX)
-	$(CC) $(CFLAGS) usermode/toolchain/perftest/ib_read_lat.c \
+ib_read_lat: $(ROOT)/usermode/toolchain/perftest/ib_read_lat.c $(LIBVERBS) $(LIBMLX)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/perftest/ib_read_lat.c \
 	    $(LIBVERBS) $(LIBMLX) -framework IOKit -o $@
 
 # mlxconfig (基于 libmft)
-mlxconfig: usermode/toolchain/mlxconfig/mlxconfig.c $(LIBMFT)
-	$(CC) $(CFLAGS) usermode/toolchain/mlxconfig/mlxconfig.c $(LIBMFT) \
+mlxconfig: $(ROOT)/usermode/toolchain/mlxconfig/mlxconfig.c $(LIBMFT)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/mlxconfig/mlxconfig.c $(LIBMFT) \
 	    -framework IOKit -o $@
 
 # mlnx-tools 系 (基于 libmft)
-mlxstatus: usermode/toolchain/mlnx-tools/mlxstatus.c $(LIBMFT)
-	$(CC) $(CFLAGS) usermode/toolchain/mlnx-tools/mlxstatus.c $(LIBMFT) \
+mlxstatus: $(ROOT)/usermode/toolchain/mlnx-tools/mlxstatus.c $(LIBMFT)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/mlnx-tools/mlxstatus.c $(LIBMFT) \
 	    -framework IOKit -o $@
 
-mlxlink: usermode/toolchain/mlnx-tools/mlxlink.c $(LIBMFT)
-	$(CC) $(CFLAGS) usermode/toolchain/mlnx-tools/mlxlink.c $(LIBMFT) \
+mlxlink: $(ROOT)/usermode/toolchain/mlnx-tools/mlxlink.c $(LIBMFT)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/mlnx-tools/mlxlink.c $(LIBMFT) \
 	    -framework IOKit -o $@
 
-mlxreg: usermode/toolchain/mlnx-tools/mlxreg.c $(LIBMFT)
-	$(CC) $(CFLAGS) usermode/toolchain/mlnx-tools/mlxreg.c $(LIBMFT) \
+mlxreg: $(ROOT)/usermode/toolchain/mlnx-tools/mlxreg.c $(LIBMFT)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/mlnx-tools/mlxreg.c $(LIBMFT) \
 	    -framework IOKit -o $@
 
-mlnx_qos: usermode/toolchain/mlnx-tools/mlnx_qos.c $(LIBMFT)
-	$(CC) $(CFLAGS) usermode/toolchain/mlnx-tools/mlnx_qos.c $(LIBMFT) \
+mlnx_qos: $(ROOT)/usermode/toolchain/mlnx-tools/mlnx_qos.c $(LIBMFT)
+	$(CC) $(CFLAGS) $(ROOT)/usermode/toolchain/mlnx-tools/mlnx_qos.c $(LIBMFT) \
 	    -framework IOKit -o $@
 
 clean:

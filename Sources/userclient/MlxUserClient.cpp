@@ -26,6 +26,27 @@
 #define super IOUserClient
 OSDefineMetaClassAndStructors(MlxUserClient, IOUserClient)
 
+bool MlxUserClient::initWithTask(task_t owningTask, void *securityToken,
+                                 UInt32 type, OSDictionary *properties)
+{
+    if (IOUserClient::clientHasPrivilege(
+            securityToken, kIOClientPrivilegeAdministrator) !=
+        kIOReturnSuccess)
+        return false;
+    if (!super::initWithTask(owningTask, securityToken, type, properties))
+        return false;
+    fOwningTask = owningTask;
+    fRoce = NULL;
+    fCore = NULL;
+    fOwnedQp = NULL;
+    fOwnedCq = NULL;
+    fOwnedMr = NULL;
+    fOwnedAh = NULL;
+    fOwnedLock = NULL;
+    fActiveCq = 0;
+    return true;
+}
+
 bool MlxUserClient::start(IOService *provider)
 {
     if (!super::start(provider))
@@ -39,26 +60,126 @@ bool MlxUserClient::start(IOService *provider)
     fRoce->retain();
     fCore = fRoce->getCore();
     fOwnedQp = OSArray::withCapacity(8);
+    fOwnedCq = OSArray::withCapacity(8);
     fOwnedMr = OSArray::withCapacity(8);
     fOwnedAh = OSArray::withCapacity(8);
+    fOwnedLock = IOLockAlloc();
+    if (!fOwnedQp || !fOwnedCq || !fOwnedMr || !fOwnedAh || !fOwnedLock) {
+        cleanup();
+        return false;
+    }
     return true;
 }
 
 void MlxUserClient::stop(IOService *provider)
 {
-    if (fRoce) {
-        fRoce->release();
-        fRoce = NULL;
-    }
+    cleanup();
     super::stop(provider);
+}
+
+void MlxUserClient::free()
+{
+    cleanup();
+    super::free();
 }
 
 IOReturn MlxUserClient::clientClose(void)
 {
+    cleanup();
+    return super::clientClose();
+}
+
+void MlxUserClient::cleanup()
+{
+    releaseOwnedResources();
     if (fOwnedQp) { fOwnedQp->release(); fOwnedQp = NULL; }
+    if (fOwnedCq) { fOwnedCq->release(); fOwnedCq = NULL; }
     if (fOwnedMr) { fOwnedMr->release(); fOwnedMr = NULL; }
     if (fOwnedAh) { fOwnedAh->release(); fOwnedAh = NULL; }
-    return super::clientClose();
+    if (fOwnedLock) { IOLockFree(fOwnedLock); fOwnedLock = NULL; }
+    if (fRoce) { fRoce->release(); fRoce = NULL; }
+    fCore = NULL;
+}
+
+bool MlxUserClient::addOwned(OSArray *table, uint32_t handle)
+{
+    if (!table || !fOwnedLock)
+        return false;
+    OSData *record = OSData::withBytes(&handle, sizeof(handle));
+    if (!record)
+        return false;
+    IOLockLock(fOwnedLock);
+    bool added = table->setObject(record);
+    IOLockUnlock(fOwnedLock);
+    record->release();
+    return added;
+}
+
+bool MlxUserClient::removeOwned(OSArray *table, uint32_t handle)
+{
+    if (!table || !fOwnedLock)
+        return false;
+    bool found = false;
+    IOLockLock(fOwnedLock);
+    for (uint32_t i = 0; i < table->getCount(); i++) {
+        OSData *record = OSDynamicCast(OSData, table->getObject(i));
+        if (!record || record->getLength() != sizeof(handle) ||
+            *static_cast<const uint32_t *>(record->getBytesNoCopy()) != handle)
+            continue;
+        table->removeObject(i);
+        found = true;
+        break;
+    }
+    IOLockUnlock(fOwnedLock);
+    return found;
+}
+
+bool MlxUserClient::owns(OSArray *table, uint32_t handle)
+{
+    if (!table || !fOwnedLock)
+        return false;
+    bool found = false;
+    IOLockLock(fOwnedLock);
+    for (uint32_t i = 0; i < table->getCount(); i++) {
+        OSData *record = OSDynamicCast(OSData, table->getObject(i));
+        if (record && record->getLength() == sizeof(handle) &&
+            *static_cast<const uint32_t *>(record->getBytesNoCopy()) == handle) {
+            found = true;
+            break;
+        }
+    }
+    IOLockUnlock(fOwnedLock);
+    return found;
+}
+
+bool MlxUserClient::takeOwned(OSArray *table, uint32_t *handle)
+{
+    if (!table || !handle || !fOwnedLock)
+        return false;
+    bool found = false;
+    IOLockLock(fOwnedLock);
+    if (table->getCount()) {
+        OSData *record = OSDynamicCast(OSData, table->getObject(0));
+        if (record && record->getLength() == sizeof(*handle)) {
+            *handle = *static_cast<const uint32_t *>(record->getBytesNoCopy());
+            found = true;
+        }
+        table->removeObject(static_cast<unsigned int>(0));
+    }
+    IOLockUnlock(fOwnedLock);
+    return found;
+}
+
+void MlxUserClient::releaseOwnedResources()
+{
+    if (!fRoce)
+        return;
+    uint32_t handle;
+    while (takeOwned(fOwnedQp, &handle)) fRoce->destroyQP(handle);
+    while (takeOwned(fOwnedMr, &handle)) fRoce->deregMR(handle);
+    while (takeOwned(fOwnedAh, &handle)) fRoce->destroyAH(handle);
+    while (takeOwned(fOwnedCq, &handle)) fRoce->destroyCQ(handle);
+    fActiveCq = 0;
 }
 
 IOReturn MlxUserClient::clientMemoryForType(UInt32 type,
@@ -73,14 +194,9 @@ IOReturn MlxUserClient::clientMemoryForType(UInt32 type,
     *memory = NULL;
     switch (type) {
     case kMlxUCMemIndexUar:
-        /* UAR page: userspace writes the doorbell directly (BF register) */
-        if (fCore->getUAR() && fCore->getUAR()->getUarMemDesc()) {
-            *memory = fCore->getUAR()->getUarMemDesc();
-            (*memory)->retain();
-            *options = kIOMapReadOnly | kIOMapWriteOnly | kIOMapInhibitCache;
-            return kIOReturnSuccess;
-        }
-        break;
+        /* The current core UAR is shared by the device, not by this client.
+         * Do not expose it until per-client UAR allocation exists. */
+        return kIOReturnUnsupported;
     case kMlxUCMemIndexCqe:
         /* CQ buffer: userspace polls the CQEs directly (zero-copy poll_cq) */
         if (fRoce->getCQ() && fActiveCq) {
@@ -88,21 +204,14 @@ IOReturn MlxUserClient::clientMemoryForType(UInt32 type,
                 fRoce->getCQ()->getCqMemDesc(fActiveCq);
             if (desc) {
                 *memory = desc;
-                (*memory)->retain();
                 *options = kIOMapReadOnly | kIOMapWriteOnly;
                 return kIOReturnSuccess;
             }
         }
         break;
     case kMlxUCMemIndexDbRecord:
-        /* DB record page: userspace post_send updates the SQ/RQ head pointers
-         * See the DB page mapping in Linux uverbs */
-        if (fCore->getUAR() && fCore->getUAR()->getDbMemDesc()) {
-            *memory = fCore->getUAR()->getDbMemDesc();
-            (*memory)->retain();
-            *options = kIOMapReadOnly | kIOMapWriteOnly;
-            return kIOReturnSuccess;
-        }
+        /* The page contains other clients' DB slots. A per-client mapping
+         * must be implemented before exposing it. */
         return kIOReturnUnsupported;
     default:
         break;
@@ -113,15 +222,20 @@ IOReturn MlxUserClient::clientMemoryForType(UInt32 type,
 /* ---- method dispatch ---- */
 
 #define MLX_METHOD(name, proc, inSize, outSize) \
-    { (IOExternalMethodAction)proc, inSize, outSize, 0, 0 }
+    { (IOExternalMethodAction)proc, 0, inSize, 0, outSize }
 
 const IOExternalMethodDispatch MlxUserClient::sMethods[] = {
-    MLX_METHOD(kMlxUCMethodQueryDevice, sQueryDevice, 0, 0),
+    MLX_METHOD(kMlxUCMethodQueryDevice, sQueryDevice, 0,
+               sizeof(struct mlx_query_device_resp)),
+    MLX_METHOD(kMlxUCMethodQueryPort,   sQueryPort, 0,
+               sizeof(struct mlx_query_port_resp)),
     MLX_METHOD(kMlxUCMethodCreateQP,    sCreateQP,    sizeof(struct mlx_create_qp_req),
                sizeof(struct mlx_create_qp_resp)),
     MLX_METHOD(kMlxUCMethodModifyQP,    sModifyQP,    sizeof(struct mlx_modify_qp_req), 0),
     MLX_METHOD(kMlxUCMethodDestroyQP,   sDestroyQP,   4, 0),
-    MLX_METHOD(kMlxUCMethodCreateCQ,    sCreateCQ,    4, 4),
+    MLX_METHOD(kMlxUCMethodCreateCQ,    sCreateCQ,
+               sizeof(struct mlx_create_cq_req),
+               sizeof(struct mlx_create_cq_resp)),
     MLX_METHOD(kMlxUCMethodDestroyCQ,   sDestroyCQ,   4, 0),
     MLX_METHOD(kMlxUCMethodRegMR,       sRegMR,       sizeof(struct mlx_reg_mr_req),
                sizeof(struct mlx_reg_mr_resp)),
@@ -151,19 +265,39 @@ const IOExternalMethodDispatch MlxUserClient::sMethods[] = {
                sizeof(struct mlx_async_event)),
 };
 
-IOExternalMethod *MlxUserClient::getExternalMethodForIndex(UInt32 selector)
-{
-    if (selector < (sizeof(sMethods) / sizeof(sMethods[0])))
-        return (IOExternalMethod *)&sMethods[selector];
-    return NULL;
-}
-
 IOReturn MlxUserClient::externalMethod(uint32_t selector,
                                        IOExternalMethodArguments *args,
                                        IOExternalMethodDispatch *dispatch,
                                        OSObject *target, void *reference)
 {
-    return super::externalMethod(selector, args, dispatch, target, reference);
+    struct SelectorMap {
+        uint32_t selector;
+        uint32_t index;
+    };
+    static const SelectorMap map[] = {
+        { kMlxUCMethodQueryDevice, 0 }, { kMlxUCMethodQueryPort, 1 },
+        { kMlxUCMethodCreateQP, 2 }, { kMlxUCMethodModifyQP, 3 },
+        { kMlxUCMethodDestroyQP, 4 }, { kMlxUCMethodCreateCQ, 5 },
+        { kMlxUCMethodDestroyCQ, 6 }, { kMlxUCMethodRegMR, 7 },
+        { kMlxUCMethodDeregMR, 8 }, { kMlxUCMethodCreateAH, 9 },
+        { kMlxUCMethodDestroyAH, 10 }, { kMlxUCMethodGetGidIndex, 11 },
+        { kMlxUCMethodCCQuery, 12 }, { kMlxUCMethodCCModify, 13 },
+        { kMlxUCMethodAccessReg, 14 }, { kMlxUCMethodFwCmd, 15 },
+        { kMlxUCMethodQueryPages, 16 }, { kMlxUCMethodPortStats, 17 },
+        { kMlxUCMethodFwReset, 18 }, { kMlxUCMethodQueryFwVer, 19 },
+        { kMlxUCMethodQueryHealth, 20 }, { kMlxUCMethodVirtToPhys, 21 },
+        { kMlxUCMethodQueryCqCompletions, 22 },
+        { kMlxUCMethodGetAsyncEvent, 23 },
+    };
+    for (uint32_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (map[i].selector != selector)
+            continue;
+        return super::externalMethod(selector, args,
+                                     const_cast<IOExternalMethodDispatch *>(
+                                         &sMethods[map[i].index]),
+                                     this, reference);
+    }
+    return kIOReturnUnsupported;
 }
 
 /* ---- method implementations ---- */
@@ -173,6 +307,14 @@ IOReturn MlxUserClient::sQueryDevice(OSObject *t, void *ref,
 {
     MlxUserClient *self = (MlxUserClient *)t;
     return self->queryDevice((struct mlx_query_device_resp *)args->structureOutput);
+}
+
+IOReturn MlxUserClient::sQueryPort(OSObject *t, void *ref,
+                                   IOExternalMethodArguments *args)
+{
+    MlxUserClient *self = static_cast<MlxUserClient *>(t);
+    return self->queryPort(
+        static_cast<struct mlx_query_port_resp *>(args->structureOutput));
 }
 
 IOReturn MlxUserClient::sCreateQP(OSObject *t, void *ref,
@@ -201,8 +343,10 @@ IOReturn MlxUserClient::sCreateCQ(OSObject *t, void *ref,
                                   IOExternalMethodArguments *args)
 {
     MlxUserClient *self = (MlxUserClient *)t;
-    return self->createCQ(*(uint32_t *)args->structureInput,
-                          (uint32_t *)args->structureOutput);
+    const struct mlx_create_cq_req *req =
+        (const struct mlx_create_cq_req *)args->structureInput;
+    return self->createCQ(req->entries,
+                          (struct mlx_create_cq_resp *)args->structureOutput);
 }
 
 IOReturn MlxUserClient::sDestroyCQ(OSObject *t, void *ref,
@@ -246,8 +390,13 @@ IOReturn MlxUserClient::sGetGidIndex(OSObject *t, void *ref,
                                      IOExternalMethodArguments *args)
 {
     MlxUserClient *self = (MlxUserClient *)t;
-    return self->fRoce->getGID() ?
-           self->fRoce->getGID()->allocGIDIndex() : kIOReturnNoResources;
+    if (!args->structureOutput || !self->fRoce->getGID())
+        return kIOReturnNoResources;
+    uint32_t index = self->fRoce->getGID()->allocGIDIndex();
+    if (index == 0xFFFFFFFF)
+        return kIOReturnNoResources;
+    *(uint32_t *)args->structureOutput = index;
+    return kIOReturnSuccess;
 }
 
 IOReturn MlxUserClient::sCCQuery(OSObject *t, void *ref,
@@ -273,6 +422,11 @@ IOReturn MlxUserClient::sCCModify(OSObject *t, void *ref,
 IOReturn MlxUserClient::sAccessReg(OSObject *t, void *ref,
                                    IOExternalMethodArguments *args)
 {
+    (void)t;
+    (void)ref;
+    (void)args;
+    return kIOReturnUnsupported;
+#if 0
     /* ACCESS_REG: pass through the firmware command directly (see core/port.c mlx5_access_reg)
      * MVP: build the ACCESS_REG command and send it through the command interface */
     MlxUserClient *self = (MlxUserClient *)t;
@@ -304,11 +458,17 @@ IOReturn MlxUserClient::sAccessReg(OSObject *t, void *ref,
     }
     resp->dataSize = 240;
     return kIOReturnSuccess;
+#endif
 }
 
 IOReturn MlxUserClient::sFwCmd(OSObject *t, void *ref,
                                IOExternalMethodArguments *args)
 {
+    (void)t;
+    (void)ref;
+    (void)args;
+    return kIOReturnUnsupported;
+#if 0
     /* Firmware command passthrough (used by mlxup): any opcode */
     MlxUserClient *self = (MlxUserClient *)t;
     struct mlx_fw_cmd_req *req = (struct mlx_fw_cmd_req *)args->structureInput;
@@ -328,6 +488,7 @@ IOReturn MlxUserClient::sFwCmd(OSObject *t, void *ref,
     memcpy(resp->out, out, (outSize < 512) ? outSize : 512);
     resp->outSize = outSize;
     return kIOReturnSuccess;
+#endif
 }
 
 IOReturn MlxUserClient::sQueryPages(OSObject *t, void *ref,
@@ -344,7 +505,7 @@ IOReturn MlxUserClient::sQueryPages(OSObject *t, void *ref,
     if (kr != kIOReturnSuccess)
         return kr;
     if (args->structureOutput) {
-        uint32_t pages = OSReadBigInt32(out, 0x40) & 0xFFFFFF;
+        uint32_t pages = static_cast<uint32_t>(mlxGetBits(out, 0x60, 32));
         *(uint64_t *)args->structureOutput = pages;
     }
     return kIOReturnSuccess;
@@ -427,7 +588,8 @@ IOReturn MlxUserClient::sVirtToPhys(OSObject *t, void *ref,
     if (!args->structureInput || !args->structureOutput)
         return kIOReturnBadArgument;
     uint64_t virt = *(uint64_t *)args->structureInput;
-    uint64_t phys = self->fCore->getDMA()->lookupPhys(virt);
+    uint64_t phys = self->fCore->getDMA()->lookupPhys(
+        self->fOwningTask, virt);
     if (phys == 0)
         return kIOReturnNotFound;
     *(uint64_t *)args->structureOutput = phys;
@@ -444,6 +606,8 @@ IOReturn MlxUserClient::sQueryCqCompletions(OSObject *t, void *ref,
     if (!args->structureInput || !args->structureOutput)
         return kIOReturnBadArgument;
     uint32_t cqHandle = *(uint32_t *)args->structureInput;
+    if (!self->owns(self->fOwnedCq, cqHandle))
+        return kIOReturnNotPermitted;
     uint64_t count = self->fRoce->getCQ()->getCompletions(cqHandle);
     *(uint64_t *)args->structureOutput = count;
     return kIOReturnSuccess;
@@ -471,39 +635,79 @@ IOReturn MlxUserClient::queryDevice(struct mlx_query_device_resp *resp)
     return fRoce->queryDevice(resp);
 }
 
+IOReturn MlxUserClient::queryPort(struct mlx_query_port_resp *resp)
+{
+    if (!fRoce || !resp)
+        return kIOReturnBadArgument;
+    return fRoce->queryPort(resp);
+}
+
 IOReturn MlxUserClient::createQP(const struct mlx_create_qp_req *req,
                                  struct mlx_create_qp_resp *resp)
 {
     if (!req || !resp)
         return kIOReturnBadArgument;
-    return fRoce->createQP(req, resp);
+    if (req->pd != 1 || !owns(fOwnedCq, req->sendCq) ||
+        !owns(fOwnedCq, req->recvCq))
+        return kIOReturnNotPermitted;
+    IOReturn kr = fRoce->createQP(req, resp);
+    if (kr == kIOReturnSuccess && !addOwned(fOwnedQp, resp->qpn)) {
+        fRoce->destroyQP(resp->qpn);
+        return kIOReturnNoMemory;
+    }
+    return kr;
 }
 
 IOReturn MlxUserClient::modifyQP(const struct mlx_modify_qp_req *req)
 {
     if (!req)
         return kIOReturnBadArgument;
-    return fRoce->modifyQP(req);
+    if (!removeOwned(fOwnedQp, req->qpn))
+        return kIOReturnNotPermitted;
+    IOReturn kr = fRoce->modifyQP(req);
+    addOwned(fOwnedQp, req->qpn);
+    return kr;
 }
 
 IOReturn MlxUserClient::destroyQP(uint32_t qpn)
 {
-    return fRoce->destroyQP(qpn);
+    if (!removeOwned(fOwnedQp, qpn))
+        return kIOReturnNotPermitted;
+    IOReturn kr = fRoce->destroyQP(qpn);
+    if (kr != kIOReturnSuccess) addOwned(fOwnedQp, qpn);
+    return kr;
 }
 
-IOReturn MlxUserClient::createCQ(uint32_t cqeSize, uint32_t *cqHandle)
+IOReturn MlxUserClient::createCQ(uint32_t entries,
+                                 struct mlx_create_cq_resp *resp)
 {
-    if (!cqHandle)
+    if (!fRoce || !resp || fActiveCq != 0)
         return kIOReturnBadArgument;
-    IOReturn kr = fRoce->createCQ(cqeSize, cqHandle);
+    memset(resp, 0, sizeof(*resp));
+    IOReturn kr = fRoce->createCQ(entries, resp);
+    if (kr == kIOReturnSuccess && !addOwned(fOwnedCq, resp->cqHandle)) {
+        fRoce->destroyCQ(resp->cqHandle);
+        return kIOReturnNoMemory;
+    }
     if (kr == kIOReturnSuccess)
-        fActiveCq = *cqHandle;   /* record for clientMemoryForType mapping */
+        fActiveCq = resp->cqHandle;
     return kr;
 }
 
 IOReturn MlxUserClient::destroyCQ(uint32_t cqHandle)
 {
-    return fRoce->destroyCQ(cqHandle);
+    if (!removeOwned(fOwnedCq, cqHandle))
+        return kIOReturnNotPermitted;
+    /* The current mmap ABI exposes one CQ buffer per client. More
+     * importantly, a live QP may still reference this CQ in firmware. */
+    if (fOwnedQp && fOwnedQp->getCount() != 0) {
+        addOwned(fOwnedCq, cqHandle);
+        return kIOReturnBusy;
+    }
+    IOReturn kr = fRoce->destroyCQ(cqHandle);
+    if (kr != kIOReturnSuccess) addOwned(fOwnedCq, cqHandle);
+    if (kr == kIOReturnSuccess && fActiveCq == cqHandle) fActiveCq = 0;
+    return kr;
 }
 
 IOReturn MlxUserClient::regMR(const struct mlx_reg_mr_req *req,
@@ -511,12 +715,21 @@ IOReturn MlxUserClient::regMR(const struct mlx_reg_mr_req *req,
 {
     if (!req || !resp)
         return kIOReturnBadArgument;
-    return fRoce->regMR(req, resp);
+    IOReturn kr = fRoce->regMR(req, resp);
+    if (kr == kIOReturnSuccess && !addOwned(fOwnedMr, resp->mrHandle)) {
+        fRoce->deregMR(resp->mrHandle);
+        return kIOReturnNoMemory;
+    }
+    return kr;
 }
 
 IOReturn MlxUserClient::deregMR(uint32_t mrHandle)
 {
-    return fRoce->deregMR(mrHandle);
+    if (!removeOwned(fOwnedMr, mrHandle))
+        return kIOReturnNotPermitted;
+    IOReturn kr = fRoce->deregMR(mrHandle);
+    if (kr != kIOReturnSuccess) addOwned(fOwnedMr, mrHandle);
+    return kr;
 }
 
 IOReturn MlxUserClient::createAH(const struct mlx_create_ah_req *req,
@@ -524,10 +737,19 @@ IOReturn MlxUserClient::createAH(const struct mlx_create_ah_req *req,
 {
     if (!req || !resp)
         return kIOReturnBadArgument;
-    return fRoce->createAH(req, resp);
+    IOReturn kr = fRoce->createAH(req, resp);
+    if (kr == kIOReturnSuccess && !addOwned(fOwnedAh, resp->ahHandle)) {
+        fRoce->destroyAH(resp->ahHandle);
+        return kIOReturnNoMemory;
+    }
+    return kr;
 }
 
 IOReturn MlxUserClient::destroyAH(uint32_t ahHandle)
 {
-    return fRoce->destroyAH(ahHandle);
+    if (!removeOwned(fOwnedAh, ahHandle))
+        return kIOReturnNotPermitted;
+    IOReturn kr = fRoce->destroyAH(ahHandle);
+    if (kr != kIOReturnSuccess) addOwned(fOwnedAh, ahHandle);
+    return kr;
 }

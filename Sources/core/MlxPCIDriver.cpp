@@ -72,6 +72,7 @@ bool MlxPCIDriver::start(IOService *provider)
     fBar0Map = fPci->mapDeviceMemoryWithIndex(0);
     if (!fBar0Map) {
         IOLog("MlxPCIDriver: BAR0 mapping failed (device=0x%04x)\n", fDeviceId);
+        cleanup();
         return false;
     }
 
@@ -80,57 +81,35 @@ bool MlxPCIDriver::start(IOService *provider)
     if (!fHCA) {
         IOLog("MlxPCIDriver: unsupported device 0x%04x (supported: ConnectX-4~8)\n",
               fDeviceId);
+        cleanup();
         return false;
     }
-    /* Bind the core (loader only dispatches the type; each model exports its attach) */
-    extern void mlx_hca_attach_core(MlxHCA *hca, MlxPCIDriver *core);
-    extern void mlx_hca_attach_core_cx4(MlxHCA *hca, MlxPCIDriver *core);
-    extern void mlx_hca_attach_core_cx6(MlxHCA *hca, MlxPCIDriver *core);
-    extern void mlx_hca_attach_core_cx7(MlxHCA *hca, MlxPCIDriver *core);
-    mlx_hca_attach_core(fHCA, this);
-    mlx_hca_attach_core_cx4(fHCA, this);
-    mlx_hca_attach_core_cx6(fHCA, this);
-    mlx_hca_attach_core_cx7(fHCA, this);
+    fHCA->attachCore(this);
+    MlxVendorInfo &vendor = fHCA->mutableVendor();
+    vendor.vendorId = fPci->configRead16(kIOPCIConfigVendorID);
+    vendor.deviceId = fDeviceId;
+    vendor.revision = fPci->configRead16(kIOPCIConfigRevisionID);
 
     /* Command interface (foundation) */
     fCmd = OSTypeAlloc(MlxCmd);
     if (!fCmd || !fCmd->init(this, fBar0Map, 4096)) {
         IOLog("MlxPCIDriver: command interface init failed\n");
+        cleanup();
         return false;
     }
 
     /* Firmware handshake sequence (See mlx5_function_setup, main.c:1361) */
     if (!fwInit()) {
         IOLog("MlxPCIDriver: firmware init failed\n");
+        cleanup();
         return false;
     }
 
-    /* Event queues + UAR */
-    fEQ = OSTypeAlloc(MlxEQ);
-    if (!fEQ || !fEQ->init(this, 4)) {
-        IOLog("MlxPCIDriver: EQ init failed\n");
-        return false;
-    }
-    /* Full EQ init chain (See eq.c:696 create_async_eqs + create_comp_eqs):
-     *   - 3 async EQs (cmd/async/pages)
-     *   - N completion EQs (one per MSI-X vector)
-     *   - MSI-X interrupt registration (IOInterruptEventSource) */
-    if (fEQ->createAsyncEqs() != kIOReturnSuccess) {
-        IOLog("MlxPCIDriver: async EQ creation failed\n");
-        return false;
-    }
-    if (fEQ->createCompEqs() != kIOReturnSuccess) {
-        IOLog("MlxPCIDriver: completion EQ creation failed\n");
-        return false;
-    }
-    if (fEQ->setupInterrupts() != kIOReturnSuccess) {
-        IOLog("MlxPCIDriver: MSI-X interrupt registration failed\n");
-        return false;
-    }
-
+    /* Allocate the boot UAR before any EQ references its uar_page. */
     fUAR = OSTypeAlloc(MlxUAR);
     if (!fUAR || !fUAR->init(this)) {
         IOLog("MlxPCIDriver: UAR init failed\n");
+        cleanup();
         return false;
     }
     /* Allocate the boot UAR (used for EQ/CQ uar_page, See uar.c:165 mlx5_get_uars_page)
@@ -138,12 +117,24 @@ bool MlxPCIDriver::start(IOService *provider)
     MlxUarAlloc bootUar;
     if (fUAR->allocUar(&bootUar) != kIOReturnSuccess) {
         IOLog("MlxPCIDriver: boot UAR allocation failed\n");
+        cleanup();
         return false;
     }
 
     /* Allocate the DB record page (user-space post_send updates the queue head pointers) */
     if (fUAR->allocDbRecord() != kIOReturnSuccess) {
         IOLog("MlxPCIDriver: DB record allocation failed\n");
+        cleanup();
+        return false;
+    }
+
+    fEQ = OSTypeAlloc(MlxEQ);
+    if (!fEQ || !fEQ->init(this, 4) ||
+        fEQ->createAsyncEqs() != kIOReturnSuccess ||
+        fEQ->createCompEqs() != kIOReturnSuccess ||
+        fEQ->setupInterrupts() != kIOReturnSuccess) {
+        IOLog("MlxPCIDriver: EQ initialization failed\n");
+        cleanup();
         return false;
     }
 
@@ -151,6 +142,7 @@ bool MlxPCIDriver::start(IOService *provider)
     fHealth = OSTypeAlloc(MlxHealth);
     if (!fHealth || !fHealth->init(this)) {
         IOLog("MlxPCIDriver: health monitoring init failed\n");
+        cleanup();
         return false;
     }
     fHealth->start(1000000);   /* 1 second interval */
@@ -159,12 +151,14 @@ bool MlxPCIDriver::start(IOService *provider)
     fDMA = OSTypeAlloc(MlxDMA);
     if (!fDMA || !fDMA->init()) {
         IOLog("MlxPCIDriver: DMA service init failed\n");
+        cleanup();
         return false;
     }
 
     /* Publish child services (triggers the verbs/Ethernet layer probe) */
     if (!publishNubs()) {
         IOLog("MlxPCIDriver: nub publishing failed\n");
+        cleanup();
         return false;
     }
 
@@ -178,22 +172,38 @@ bool MlxPCIDriver::start(IOService *provider)
 
 void MlxPCIDriver::stop(IOService *provider)
 {
+    cleanup();
+    super::stop(provider);
+}
+
+void MlxPCIDriver::cleanup()
+{
+    if (fHealth) {
+        fHealth->stop();
+        fHealth->release();
+        fHealth = NULL;
+    }
+    if (fEQ)
+        fEQ->shutdown();
     if (fDMA) {
         fDMA->release();
         fDMA = NULL;
-    }
-    if (fCmd) {
-        fCmd->release();
-        fCmd = NULL;
     }
     if (fEQ) {
         fEQ->release();
         fEQ = NULL;
     }
     if (fUAR) {
-        fUAR->freeDbRecord();
         fUAR->release();
         fUAR = NULL;
+    }
+    if (fCmd && fCmd->isUp()) {
+        teardownHca();
+        disableHca();
+    }
+    if (fCmd) {
+        fCmd->release();
+        fCmd = NULL;
     }
     if (fHCA) {
         delete fHCA;
@@ -204,14 +214,16 @@ void MlxPCIDriver::stop(IOService *provider)
         fBar0Map = NULL;
     }
     if (fPci) {
+        fPci->setBusMasterEnable(false);
+        fPci->setMemoryEnable(false);
         fPci->release();
         fPci = NULL;
     }
-    super::stop(provider);
 }
 
 void MlxPCIDriver::free()
 {
+    cleanup();
     super::free();
 }
 
@@ -280,7 +292,7 @@ bool MlxPCIDriver::setIssi()
      * Steps: QUERY_ISSI → if ISSI=1 is supported then SET_ISSI=1, otherwise fall back to ISSI=0
      * Note: older ConnectX-4 firmware may only support ISSI 0 (no QUERY_ISSI support) */
     uint8_t in[16] = {};
-    uint8_t out[64] = {};
+    uint8_t out[112] = {};
 
     /* 1. QUERY_ISSI */
     OSWriteBigInt16(in, 0, MLX_CMD_OP_QUERY_ISSI);
@@ -295,7 +307,7 @@ bool MlxPCIDriver::setIssi()
     }
 
     /* 2. Check supported_issi_dw0 bit1 */
-    uint32_t supIssi = OSReadBigInt32(out, 0x40) & 0xFFFFFFFF;
+    uint32_t supIssi = static_cast<uint32_t>(mlxGetBits(out, 0x360, 32));
     if (supIssi & (1u << 1)) {
         /* 3. SET_ISSI = 1 */
         uint8_t setIn[16] = {};
@@ -339,6 +351,26 @@ bool MlxPCIDriver::initHca()
     return fCmd->exec(&cmd, 5000) == kIOReturnSuccess;
 }
 
+bool MlxPCIDriver::teardownHca()
+{
+    uint8_t in[16] = {};
+    uint8_t out[16] = {};
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_TEARDOWN_HCA);
+    MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
+                        MLX_CMD_OP_TEARDOWN_HCA };
+    return fCmd->exec(&cmd, 5000) == kIOReturnSuccess;
+}
+
+bool MlxPCIDriver::disableHca()
+{
+    uint8_t in[16] = {};
+    uint8_t out[16] = {};
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_DISABLE_HCA);
+    MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
+                        MLX_CMD_OP_DISABLE_HCA };
+    return fCmd->exec(&cmd, 5000) == kIOReturnSuccess;
+}
+
 bool MlxPCIDriver::queryHcaCaps()
 {
     /* QUERY_HCA_CAP → parse fHCA->caps()
@@ -352,7 +384,26 @@ bool MlxPCIDriver::queryHcaCaps()
     if (fCmd->exec(&cmd, 5000) != kIOReturnSuccess)
         return false;
 
-    /* Parse key fields (capability bit layout See mlx5_ifc.h:1505 cmd_hca_cap_bits) */
+    const uint8_t *cap = out + 16; /* query_hca_cap_out capability@bit 0x80 */
+    MlxHcaCaps &caps = fHCA->mutableCaps();
+    memset(&caps, 0, sizeof(caps));
+    caps.fwRev = mlxMMIORead32BE(
+        fBar0Map, offsetof(struct MlxInitSeg, fw_rev));
+    caps.cmdifRev = fCmd->cmdifRev();
+    caps.maxQp = 1u << mlxGetBits(cap, 0x9b, 5);
+    caps.maxCq = 1u << mlxGetBits(cap, 0xdb, 5);
+    caps.maxMr = 1u << mlxGetBits(cap, 0xea, 6);
+    caps.portType = static_cast<uint8_t>(mlxGetBits(cap, 0x1b6, 2));
+    caps.numPorts = static_cast<uint32_t>(mlxGetBits(cap, 0x1b8, 8));
+    caps.roce = mlxGetBits(cap, 0x21e, 1) != 0;
+    caps.uar4k = mlxGetBits(cap, 0x2a6, 1) != 0;
+    caps.roceRwSupported = mlxGetBits(cap, 0x33f, 1) != 0;
+    caps.roceMaxGid = static_cast<uint16_t>(mlxGetBits(cap, 0x170, 16));
+    caps.roceVersions = caps.roce ? 0x3 : 0;
+    caps.roceDstUdpPort = MLX_ROCE_V2_UDP_DPORT;
+    caps.ibSupported = caps.portType == MLX_PORT_TYPE_IB;
+    caps.ibMaxPkeys = static_cast<uint16_t>(mlxGetBits(cap, 0x190, 16));
+    if (!caps.numPorts) caps.numPorts = 1;
     IOLog("MlxPCIDriver: capability query complete\n");
     return true;
 }
@@ -381,7 +432,7 @@ bool MlxPCIDriver::publishNubs()
      * See mlx5_register_device → add_adev (dev.c:306)
      * deviceName: multi-device identifier (mlx5_0/mlx5_1), enumerated by name in user space */
     setProperty("mlx_rdma", true);
-    setProperty("mlx_eth", true);
+    setProperty("mlx_eth", false);
     setProperty("deviceName", fDevName);
     return true;
 }

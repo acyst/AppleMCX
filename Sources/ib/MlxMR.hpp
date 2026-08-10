@@ -9,6 +9,7 @@
 
 #include <libkern/OSTypes.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IODMACommand.h>
 #include "MlxUCIO.h"
 
 class MlxRoCE;
@@ -28,6 +29,7 @@ struct MlxMRContext {
     uint64_t    length;
     uint32_t    accessFlags;
     IOMemoryDescriptor *fMemDesc;   /* pinned user memory */
+    IODMACommand *fDmaCommand;      /* retained IOMMU mapping */
 };
 
 /*
@@ -38,6 +40,7 @@ class MlxMR : public OSObject {
 
 public:
     bool init(MlxRoCE *roce);
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* Register a user MR (see mlx5_ib_reg_user_mr, mr.c:1391) */
     kern_return_t regMR(const struct mlx_reg_mr_req *req,
@@ -48,7 +51,7 @@ public:
 private:
     /* Build the PBL (physical address list); see reg_create, mr.c:1097 */
     kern_return_t buildPBL(IOMemoryDescriptor *mem, uint64_t *paList,
-                           uint32_t *numSegs);
+                           uint32_t *numSegs, IODMACommand **dmaCommand);
 
     /* CREATE_MKEY command (see mlx5_ib_create_mkey, mr.c:101) */
     kern_return_t cmdCreateMKey(const uint64_t *paList, uint32_t numSegs,

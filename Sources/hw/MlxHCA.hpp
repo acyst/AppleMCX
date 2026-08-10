@@ -16,6 +16,8 @@
 #include "MlxRegs.hpp"
 #include "MlxUCIO.h"   /* MLX_LINK_LAYER_* constants */
 
+class MlxPCIDriver;
+
 /* Port types (firmware port_type values) */
 enum MlxPortType {
     MLX_PORT_TYPE_IB  = 0,
@@ -89,10 +91,13 @@ struct MlxVendorInfo {
 class MlxHCA {
 public:
     virtual ~MlxHCA() {}
+    virtual void attachCore(MlxPCIDriver *core) = 0;
 
     /* Capabilities */
     virtual const MlxHcaCaps &caps() const = 0;
     virtual const MlxVendorInfo &vendor() const = 0;
+    virtual MlxHcaCaps &mutableCaps() = 0;
+    virtual MlxVendorInfo &mutableVendor() = 0;
 
     /* Command execution (implemented by MlxCmd) */
     virtual kern_return_t exec(uint32_t opcode, const void *in,

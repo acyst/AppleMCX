@@ -202,8 +202,8 @@ struct MlxCqe64 {
     uint8_t  op_own;            /* ★ [7:4]opcode [1:0]owner */
 };
 
-/* CQE ownership bit: (op_own >> 1) & 1 */
-#define MLX_CQE_OWNER_MASK      (1u << 1)
+/* CQE ownership phase bit is bit 0 of op_own. */
+#define MLX_CQE_OWNER_MASK      1u
 
 /* CQE opcode bits: op_own >> 4 */
 #define MLX_CQE_GET_OPCODE(cqe) ((cqe)->op_own >> 4)

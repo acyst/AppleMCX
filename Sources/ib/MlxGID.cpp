@@ -3,7 +3,7 @@
  *
  * Ported from: drivers/net/ethernet/mellanox/mlx5/core/lib/gid.c (mlx5_core_roce_gid_set)
  *        + drivers/net/ethernet/mellanox/mlx5/core/rdma.c (make_default_gid)
- * macOS difference: use SCDynamicStore to monitor IP changes instead of Linux ib_core GID table maintenance
+ * macOS difference: userspace policy supplies address changes to the driver.
  */
 #include "MlxGID.hpp"
 #include "MlxRoCE.hpp"
@@ -18,6 +18,24 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxGID, OSObject)
 
+void MlxGID::free()
+{
+    stopAddressMonitor();
+    if (fTable) {
+        IOFree(fTable, sizeof(MlxGIDEntry) * fTableSize);
+        fTable = NULL;
+    }
+    if (fUsed) {
+        IOFree(fUsed, sizeof(bool) * fTableSize);
+        fUsed = NULL;
+    }
+    if (fLock) {
+        IOLockFree(fLock);
+        fLock = NULL;
+    }
+    super::free();
+}
+
 bool MlxGID::init(MlxRoCE *roce, uint32_t tableSize)
 {
     if (!super::init())
@@ -29,8 +47,6 @@ bool MlxGID::init(MlxRoCE *roce, uint32_t tableSize)
     fTable = (MlxGIDEntry *)IOMallocZero(sizeof(MlxGIDEntry) * tableSize);
     fUsed = (bool *)IOMallocZero(sizeof(bool) * tableSize);
     fLock = IOLockAlloc();
-    fSCDynStore = NULL;
-    fRunLoopSrc = NULL;
     fMonitoring = false;
     if (!fTable || !fUsed || !fLock)
         return false;
@@ -152,29 +168,14 @@ kern_return_t MlxGID::delGID(uint32_t index)
 
 void MlxGID::startAddressMonitor()
 {
-    /* macOS-specific: monitor network configuration changes (IP address)
-     * Full implementation uses an SCDynamicStore callback; P3 registers the framework first */
-    fMonitoring = true;
-    IOLog("MlxGID: IP address monitor started\n");
+    /* Address configuration is a userspace policy operation. A daemon can
+     * update GIDs through a constrained control method when implemented. */
+    fMonitoring = false;
 }
 
 void MlxGID::stopAddressMonitor()
 {
     fMonitoring = false;
-    if (fRunLoopSrc) {
-        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), fRunLoopSrc,
-                              kCFRunLoopDefaultMode);
-        fRunLoopSrc = NULL;
-    }
-}
-
-void MlxGID::scCallback(SCDynamicStoreRef store, void *context)
-{
-    MlxGID *self = (MlxGID *)context;
-    if (!self || !self->fMonitoring)
-        return;
-    /* IP change → rewrite the firmware GID table
-     * Full implementation: read the new IP, build the GID, call setGID (later in P3) */
 }
 
 kern_return_t MlxGID::getLocalAddr(uint8_t *gid, uint8_t *mac)

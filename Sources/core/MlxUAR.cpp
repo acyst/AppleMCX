@@ -20,6 +20,24 @@
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxUAR, OSObject)
 
+void MlxUAR::free()
+{
+    freeDbRecord();
+    if (fBootUarValid) {
+        freeUar(&fBootUar);
+        fBootUarValid = false;
+    }
+    if (fUarPool) {
+        fUarPool->release();
+        fUarPool = NULL;
+    }
+    if (fDbLock) {
+        IOLockFree(fDbLock);
+        fDbLock = NULL;
+    }
+    super::free();
+}
+
 bool MlxUAR::init(MlxPCIDriver *owner)
 {
     if (!super::init())
@@ -31,10 +49,57 @@ bool MlxUAR::init(MlxPCIDriver *owner)
     fUarMemDesc = NULL;
     fUarMap = NULL;
     fBootIndex = 0;
+    memset(&fBootUar, 0, sizeof(fBootUar));
+    fBootUarValid = false;
     fDbRecord = NULL;
     fDbRecordDMA = 0;
     fDbMemDesc = NULL;
-    return true;
+    fDbDmaMap = NULL;
+    fDbBitmap[0] = 0;
+    fDbBitmap[1] = 0;
+    fDbLock = IOLockAlloc();
+    return fUarPool != NULL && fDbLock != NULL;
+}
+
+kern_return_t MlxUAR::allocDbSlots(uint32_t count, uint32_t *offset)
+{
+    if (!fDbLock || !fDbRecord || !offset || count == 0 || count > 2)
+        return kIOReturnBadArgument;
+    IOLockLock(fDbLock);
+    for (uint32_t slot = 0; slot + count <= 128; slot++) {
+        bool free = true;
+        for (uint32_t i = 0; i < count; i++) {
+            if (fDbBitmap[(slot + i) >> 6] &
+                (1ULL << ((slot + i) & 63))) {
+                free = false;
+                break;
+            }
+        }
+        if (!free)
+            continue;
+        for (uint32_t i = 0; i < count; i++)
+            fDbBitmap[(slot + i) >> 6] |= 1ULL << ((slot + i) & 63);
+        *offset = slot * sizeof(uint32_t);
+        memset(reinterpret_cast<uint8_t *>(fDbRecord) + *offset, 0,
+               count * sizeof(uint32_t));
+        IOLockUnlock(fDbLock);
+        return kIOReturnSuccess;
+    }
+    IOLockUnlock(fDbLock);
+    return kIOReturnNoResources;
+}
+
+void MlxUAR::freeDbSlots(uint32_t offset, uint32_t count)
+{
+    if (!fDbLock || count == 0 || offset % sizeof(uint32_t))
+        return;
+    uint32_t slot = offset / sizeof(uint32_t);
+    if (slot + count > 128)
+        return;
+    IOLockLock(fDbLock);
+    for (uint32_t i = 0; i < count; i++)
+        fDbBitmap[(slot + i) >> 6] &= ~(1ULL << ((slot + i) & 63));
+    IOLockUnlock(fDbLock);
 }
 
 kern_return_t MlxUAR::allocDbRecord()
@@ -46,14 +111,14 @@ kern_return_t MlxUAR::allocDbRecord()
         kernel_task, kIODirectionInOut, 4096, 0xFFFFFFF000ULL);
     if (!fDbMemDesc)
         return kIOReturnNoMemory;
-    if (fDbMemDesc->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+    memset(fDbMemDesc->getBytesNoCopy(), 0, 4096);
+    fDbRecord = (uint32_t *)fDbMemDesc->getBytesNoCopy();
+    if (mlxMapDMAContiguous(fDbMemDesc, &fDbDmaMap, &fDbRecordDMA) !=
+        kIOReturnSuccess) {
         fDbMemDesc->release();
         fDbMemDesc = NULL;
         return kIOReturnNoMemory;
     }
-    memset(fDbMemDesc->getBytesNoCopy(), 0, 4096);
-    fDbRecord = (uint32_t *)fDbMemDesc->getBytesNoCopy();
-    fDbRecordDMA = fDbMemDesc->getPhysicalSegment(0, 0);
     IOLog("MlxUAR: DB record page allocated dma=0x%llx\n", fDbRecordDMA);
     return kIOReturnSuccess;
 }
@@ -61,7 +126,8 @@ kern_return_t MlxUAR::allocDbRecord()
 void MlxUAR::freeDbRecord()
 {
     if (fDbMemDesc) {
-        fDbMemDesc->complete();
+        mlxUnmapDMA(fDbDmaMap);
+        fDbDmaMap = NULL;
         fDbMemDesc->release();
         fDbMemDesc = NULL;
         fDbRecord = NULL;
@@ -130,15 +196,21 @@ kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
             fUarMemDesc = desc;   /* keep for user-space mapping */
         } else {
             desc->release();
+            cmdFreeUar(index);
             return kIOReturnError;
         }
     } else {
+        cmdFreeUar(index);
         return kIOReturnNoMemory;
     }
 
     /* The first allocated UAR becomes the boot UAR (used for EQ/CQ uar_page) */
     if (fBootIndex == 0 && fUarPool->getCount() == 0)
         fBootIndex = index;
+    if (!fBootUarValid) {
+        fBootUar = *uar;
+        fBootUarValid = true;
+    }
     /* Pool record (MVP: record the virtual address for reuse) */
     OSData *record = OSData::withBytes(uar, sizeof(MlxUarAlloc));
     if (record) {
@@ -153,6 +225,8 @@ kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
 
 void MlxUAR::freeUar(MlxUarAlloc *uar)
 {
+    if (!uar)
+        return;
     cmdFreeUar(uar->index);
     if (fUarMap) {
         fUarMap->release();
@@ -162,6 +236,8 @@ void MlxUAR::freeUar(MlxUarAlloc *uar)
         fUarMemDesc->release();
         fUarMemDesc = NULL;
     }
+    if (fBootUarValid && fBootUar.index == uar->index)
+        fBootUarValid = false;
 }
 
 kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
@@ -176,8 +252,10 @@ kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
     fUarBitmap |= (1u << dbi);
 
     bfreg->offset = MLX_BF_OFFSET + (dbi << 12);
-    if (!fUarMap)
+    if (!fUarMap || bfreg->offset + sizeof(uint64_t) > 4096) {
+        fUarBitmap &= ~(1u << dbi);
         return kIOReturnNotReady;
+    }
     bfreg->map = reinterpret_cast<void *>(
         static_cast<uintptr_t>(fUarMap->getVirtualAddress()) + bfreg->offset);
     IOLog("MlxUAR: BF allocated dbi=%u offset=0x%x\n", dbi, bfreg->offset);
@@ -186,6 +264,11 @@ kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
 
 void MlxUAR::freeBfreg(MlxBfreg *bfreg)
 {
+    if (!bfreg || bfreg->offset < MLX_BF_OFFSET ||
+        ((bfreg->offset - MLX_BF_OFFSET) & 0xFFF))
+        return;
     uint32_t dbi = (bfreg->offset - MLX_BF_OFFSET) >> 12;
+    if (dbi >= 4)
+        return;
     fUarBitmap &= ~(1u << dbi);
 }

@@ -63,7 +63,10 @@ private:
     bool setIssi();
     bool setHcaCaps();
     bool initHca();
+    bool teardownHca();
+    bool disableHca();
     bool queryHcaCaps();
+    void cleanup();
 
     /* Capability negotiation (See handle_hca_cap, main.c:712) */
     bool negotiateRoceCap();

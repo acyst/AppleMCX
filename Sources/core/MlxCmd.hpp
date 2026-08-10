@@ -16,13 +16,15 @@
 #include "MlxWQE.hpp"
 
 /* Maximum number of command slots (See MLX5_MAX_COMMANDS) */
-#define MLX_MAX_COMMANDS        (1 << 8)
+#define MLX_MAX_COMMANDS        32
 
 /* Command descriptor size (64 bytes), See device.h:525 mlx5_cmd_layout */
 #define MLX_COMMAND_DESCRIPTOR_SIZE 64
 
 /* Mailbox data block size (512 bytes), See MLX5_CMD_DATA_BLOCK_SIZE */
 #define MLX_CMD_DATA_BLOCK_SIZE 512
+#define MLX_CMD_MAX_BLOCKS      8
+#define MLX_CMD_MAX_SIZE        (16 + MLX_CMD_MAX_BLOCKS * MLX_CMD_DATA_BLOCK_SIZE)
 
 class MlxPCIDriver;
 
@@ -59,6 +61,11 @@ struct MlxCmdMailbox {
     uint8_t  sig;
 } __attribute__((packed));
 
+static_assert(sizeof(MlxCmdLayout) == MLX_COMMAND_DESCRIPTOR_SIZE,
+              "mlx5 command layout must be 64 bytes");
+static_assert(sizeof(MlxCmdMailbox) == 576,
+              "mlx5 command mailbox must be 576 bytes");
+
 /*
  * Command input/output descriptor
  */
@@ -82,12 +89,17 @@ struct MlxCmdEnt {
     /* descriptor pointer (within command queue page) */
     MlxCmdLayout *lay;
     /* in/out mailbox (allocated for large commands) */
-    IOBufferMemoryDescriptor *inMailboxDesc;
-    IOBufferMemoryDescriptor *outMailboxDesc;
-    void       *inMailbox;
-    uint64_t    inMailboxDMA;
-    void       *outMailbox;
-    uint64_t    outMailboxDMA;
+    uint32_t    inNumBlocks;
+    uint32_t    outNumBlocks;
+    IOBufferMemoryDescriptor *inMailboxDesc[MLX_CMD_MAX_BLOCKS];
+    IOBufferMemoryDescriptor *outMailboxDesc[MLX_CMD_MAX_BLOCKS];
+    IODMACommand *inMailboxMap[MLX_CMD_MAX_BLOCKS];
+    IODMACommand *outMailboxMap[MLX_CMD_MAX_BLOCKS];
+    MlxCmdMailbox *inMailbox[MLX_CMD_MAX_BLOCKS];
+    MlxCmdMailbox *outMailbox[MLX_CMD_MAX_BLOCKS];
+    uint64_t    inMailboxDMA[MLX_CMD_MAX_BLOCKS];
+    uint64_t    outMailboxDMA[MLX_CMD_MAX_BLOCKS];
+    bool        timedOut;
 };
 
 /*
@@ -109,6 +121,7 @@ public:
     /* Command interface state */
     bool isUp() const { return fUp; }
     uint16_t cmdifRev() const { return fCmdifRev; }
+    virtual void free() APPLE_KEXT_OVERRIDE;
 
 private:
     /* Allocate/free an idle slot */
@@ -132,6 +145,7 @@ private:
     MlxPCIDriver    *fOwner;
     IOMemoryMap     *fBar0;
     IOBufferMemoryDescriptor *fCmdBufDesc;
+    IODMACommand    *fCmdBufMap;
     void            *fCmdBuf;       /* command queue page virtual address */
     uint64_t         fCmdDMA;       /* command queue DMA address */
     uint8_t          fLogSz;
@@ -143,6 +157,7 @@ private:
     IOSimpleLock    *fTokenLock;
     MlxCmdEnt       *fEntArr[MLX_MAX_COMMANDS];
     bool             fUp;
+    bool             fQuarantined;
     bool             fModeEvents;
     uint16_t         fCmdifRev;    /* command interface revision (filled by init) */
 };
