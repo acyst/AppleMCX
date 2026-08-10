@@ -8,6 +8,7 @@
 #define MLX_CMD_HPP
 
 #include <libkern/OSTypes.h>
+#include <libkern/OSAtomic.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include "MlxRegs.hpp"

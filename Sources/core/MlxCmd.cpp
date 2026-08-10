@@ -19,7 +19,6 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOKitDebug.h>
 #include <IOKit/IOMemoryDescriptor.h>
-#include <IOKit/IOMemoryMap.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOBSD.h>
 #include <IOKit/IOInterruptEventSource.h>
