@@ -16,7 +16,8 @@
 class MlxRoCE;
 class MlxPCIDriver;
 
-#define MLX_MAX_MR_SEGMENTS     64
+/* MLX_CMD_MAX_SIZE permits 480 8-byte MTT entries after the fixed input. */
+#define MLX_MAX_MR_SEGMENTS     480
 
 /*
  * MR instance (see struct mlx5_ib_mr)
@@ -51,7 +52,8 @@ public:
 
 private:
     /* Build the PBL (physical address list); see reg_create, mr.c:1097 */
-    kern_return_t buildPBL(IOMemoryDescriptor *mem, uint64_t *paList,
+    kern_return_t buildPBL(IOMemoryDescriptor *mem, uint64_t startAddr,
+                           uint64_t length, uint64_t *paList,
                            uint32_t *numSegs, IODMACommand **dmaCommand);
 
     /* CREATE_MKEY command (see mlx5_ib_create_mkey, mr.c:101) */
@@ -66,6 +68,7 @@ private:
     MlxPCIDriver *fCore;
     OSArray     *fMrTable;
     IOLock      *fLock;
+    uint8_t      fMkeyVariant;
 };
 
 #endif /* MLX_MR_HPP */

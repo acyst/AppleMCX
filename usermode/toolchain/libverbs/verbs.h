@@ -87,8 +87,8 @@ enum {
     IBV_QP_SQ_PSN = (1 << 16),
     IBV_QP_MAX_DEST_RD_ATOMIC = (1 << 17),
     IBV_QP_PATH_MIG_STATE = (1 << 18),
-    IBV_QP_CAP = (1 << 20),
-    IBV_QP_DEST_QPN = (1 << 21),
+    IBV_QP_CAP = (1 << 19),
+    IBV_QP_DEST_QPN = (1 << 20),
 };
 
 /* MTU */

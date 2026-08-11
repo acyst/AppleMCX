@@ -589,7 +589,7 @@ int mlx_post_send(mlx_qp *qp, const struct mlx_send_wr *wr)
     ctrl->opmod_idx_opcode = host_to_be32((idx << 8) | opcode);
     /* qpn_ds: wqeSize16<<16 | qpn */
     ctrl->qpn_ds = host_to_be32((wqeSize16 << 16) | qp->qpn);
-    ctrl->fm_ce_se = 0x02;   /* ce (generate completion event) */
+    ctrl->fm_ce_se = MLX_WQE_CTRL_CQ_UPDATE;
 
     uint32_t off = 16;
 

@@ -56,6 +56,9 @@ public:
     uint32_t getDevIdx() const { return fDevIdx; }
     const char *getDevName() const { return fDevName; }
 
+    /* RoCE remains opt-in until the isolated userspace ABI is implemented. */
+    bool rocePublicationAllowed() const;
+
 private:
     /* Firmware initialization sequence (See mlx5_function_setup, main.c:1361) */
     bool fwInit();

@@ -24,6 +24,10 @@
 #define super IOService
 OSDefineMetaClassAndStructors(MlxPCIDriver, IOService)
 
+#ifndef APPLEMCX_ENABLE_UNSAFE_ROCE
+#define APPLEMCX_ENABLE_UNSAFE_ROCE 0
+#endif
+
 /* ---- Lifecycle ---- */
 
 bool MlxPCIDriver::init(OSDictionary *properties)
@@ -441,8 +445,20 @@ bool MlxPCIDriver::publishNubs()
      * and the Ethernet layer (MlxEthernetDriver)
      * See mlx5_register_device → add_adev (dev.c:306)
      * deviceName: multi-device identifier (mlx5_0/mlx5_1), enumerated by name in user space */
-    setProperty("mlx_rdma", true);
+    if (rocePublicationAllowed())
+        setProperty("mlx_rdma", true);
+    else
+        removeProperty("mlx_rdma");
     setProperty("mlx_eth", !fHCA->caps().isIB());
     setProperty("deviceName", fDevName);
     return true;
+}
+
+bool MlxPCIDriver::rocePublicationAllowed() const
+{
+#if APPLEMCX_ENABLE_UNSAFE_ROCE
+    return fHCA && fHCA->caps().roce && fEQ && fDMA && fUAR;
+#else
+    return false;
+#endif
 }

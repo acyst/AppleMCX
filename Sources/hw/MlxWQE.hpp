@@ -34,8 +34,8 @@ struct MlxWqeCtrlSeg {
 };
 
 /* ctrl segment fm_ce_se bits */
-#define MLX_WQE_CTRL_CQ_UPDATE  0x2   /* ce */
-#define MLX_WQE_CTRL_SOLICIT    0x1   /* se */
+#define MLX_WQE_CTRL_CQ_UPDATE  0x08  /* 2 << 2: generate CQE */
+#define MLX_WQE_CTRL_SOLICIT    0x02  /* 1 << 1: solicited event */
 
 /*
  * WQE data segment (16 bytes) — one per SGE

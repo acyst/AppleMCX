@@ -11,6 +11,7 @@
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
 #include "MlxKernelCompat.hpp"
+#include "MlxP0Encoding.hpp"
 
 #include <string.h>
 #include <IOKit/IOLib.h>
@@ -33,16 +34,8 @@ void MlxQP::free()
                     if (destroyQP(qpn) == kIOReturnSuccess)
                         continue;
                 }
-                if (fRoce && fRoce->getCore() && fRoce->getCore()->getDMA()) {
-                    if (ctx->sqPinned)
-                        fRoce->getCore()->getDMA()->unpinMemory(&ctx->sqDma);
-                    if (ctx->rqPinned)
-                        fRoce->getCore()->getDMA()->unpinMemory(&ctx->rqDma);
-                }
-                if (fRoce && fRoce->getCore() && fRoce->getCore()->getUAR())
-                    fRoce->getCore()->getUAR()->freeDbSlots(
-                        ctx->dbRecordOffset, 2);
-                IOFree(ctx, sizeof(*ctx));
+                IOLog("MlxQP: quarantining QP[%u] DMA after unverified destroy\n",
+                      qpn);
             }
             fQpTable->removeObject(static_cast<unsigned int>(0));
         }
@@ -63,7 +56,7 @@ bool MlxQP::init(MlxRoCE *roce)
     fRoce = roce;
     fQpTable = OSArray::withCapacity(32);
     fLock = IOLockAlloc();
-    return true;
+    return fQpTable && fLock;
 }
 
 kern_return_t MlxQP::createQP(const struct mlx_create_qp_req *req,
@@ -178,10 +171,14 @@ kern_return_t MlxQP::createQP(const struct mlx_create_qp_req *req,
     /* Record the QP context */
     MlxQPContext *ctx = (MlxQPContext *)IOMallocZero(sizeof(MlxQPContext));
     if (!ctx) {
-        destroyQP(qpn);
-        if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
-        if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
-        fRoce->getCore()->getUAR()->freeDbSlots(dbRecordOffset, 2);
+        if (destroyQP(qpn) == kIOReturnSuccess) {
+            if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
+            if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
+            fRoce->getCore()->getUAR()->freeDbSlots(dbRecordOffset, 2);
+        } else {
+            IOLog("MlxQP: quarantining QP[%u] DMA after allocation failure\n",
+                  qpn);
+        }
         return kIOReturnNoMemory;
     }
     ctx->qpNum = qpn;
@@ -205,11 +202,15 @@ kern_return_t MlxQP::createQP(const struct mlx_create_qp_req *req,
 
     OSData *record = OSData::withBytesNoCopy(ctx, sizeof(*ctx));
     if (!record) {
-        IOFree(ctx, sizeof(MlxQPContext));
-        destroyQP(qpn);
-        if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
-        if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
-        fRoce->getCore()->getUAR()->freeDbSlots(dbRecordOffset, 2);
+        if (destroyQP(qpn) == kIOReturnSuccess) {
+            IOFree(ctx, sizeof(MlxQPContext));
+            if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
+            if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
+            fRoce->getCore()->getUAR()->freeDbSlots(dbRecordOffset, 2);
+        } else {
+            IOLog("MlxQP: quarantining QP[%u] after record allocation failure\n",
+                  qpn);
+        }
         return kIOReturnNoMemory;
     }
     IOLockLock(fLock);
@@ -217,11 +218,15 @@ kern_return_t MlxQP::createQP(const struct mlx_create_qp_req *req,
     IOLockUnlock(fLock);
     record->release();
     if (!added) {
-        IOFree(ctx, sizeof(MlxQPContext));
-        destroyQP(qpn);
-        if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
-        if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
-        fRoce->getCore()->getUAR()->freeDbSlots(dbRecordOffset, 2);
+        if (destroyQP(qpn) == kIOReturnSuccess) {
+            IOFree(ctx, sizeof(MlxQPContext));
+            if (sqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&sqReq);
+            if (rqReq.memDesc) fRoce->getCore()->getDMA()->unpinMemory(&rqReq);
+            fRoce->getCore()->getUAR()->freeDbSlots(dbRecordOffset, 2);
+        } else {
+            IOLog("MlxQP: quarantining QP[%u] after table insertion failure\n",
+                  qpn);
+        }
         return kIOReturnNoMemory;
     }
 
@@ -250,7 +255,7 @@ kern_return_t MlxQP::modifyQP(const struct mlx_modify_qp_req *req)
     }
     /* See __mlx5_ib_modify_qp (qp.c:4166) + optab state machine
      * modify_qp_in layout (mlx5_ifc.h:5178):
-     *   header 64B + qpn@0x40 + opt_param_mask@0x60 + ece@0x80 + qpc@0xA0
+     *   header + qpn@0x48 + opt_param_mask@0x80 + ece@0xa0 + qpc@0xc0
      * State transitions: RST→INIT (RST2INIT) / INIT→RTR (INIT2RTR) / RTR→RTS (RTR2RTS) */
     uint32_t opcode;
     switch (ctx->state) {
@@ -280,28 +285,29 @@ kern_return_t MlxQP::modifyQP(const struct mlx_modify_qp_req *req)
         return kIOReturnUnsupported;
     }
 
-    uint8_t in[272] = {};
+    uint8_t in[MLX_QP_MODIFY_IN_BYTES] = {};
     uint8_t out[16] = {};
-    uint32_t qpcOff = 0xc0 / 8;
+    uint32_t qpcOff = MLX_QPC_BIT_OFFSET / 8;
 
     OSWriteBigInt16(in, 0, opcode);
     mlxSetBits(in, 0x48, 24, req->qpn);
-    mlxSetBits(in, 0x80, 32, req->attrMask);
+    uint32_t optParamMask = 0;
 
     /* QPC */
     uint8_t *qpc = in + qpcOff;
-    mlxSetBits(qpc, 0x08, 8, MLX_QP_ST_RC);
 
-    /* pkey_index + destination QPN (see qpc_bits: pkey_index@0x3C8, remote_qpn@0xA8) */
+    /* pkey_index is in the primary ADS, not at next_send_psn@0x3c8. */
     if (opcode == MLX_CMD_OP_RST2INIT_QP) {
-        /* pkey_index at qpc +0x3C8 (low 16 bits) */
-        mlxSetBits(qpc, 0x3c8, 16, req->pkeyIndex);
+        if (!mlxEncodeRst2InitQpc(qpc, MLX_QPC_BYTES, req->pkeyIndex,
+                                  req->portNum, &optParamMask)) {
+            IOLockUnlock(fLock);
+            return kIOReturnBadArgument;
+        }
+        ctx->pkeyIndex = static_cast<uint16_t>(req->pkeyIndex);
+        ctx->portNum = static_cast<uint8_t>(req->portNum);
     }
     if (opcode == MLX_CMD_OP_INIT2RTR_QP) {
         uint32_t dqpn = req->destQpn;
-        mlxSetBits(qpc, 0xa8, 24, dqpn);
-        mlxSetBits(qpc, 0x40, 3, req->pathMtu);
-        mlxSetBits(qpc, 0x4a8, 24, req->rqPsn);
         /* Fill the RoCE path data into ctx (see mlx5_set_path, qp.c:3583)
          * AH fields: destination MAC/GID, source GID index, TTL, DSCP, UDP sport */
         memcpy(ctx->ahDmac, req->ahDmac, 6);
@@ -311,14 +317,32 @@ kern_return_t MlxQP::modifyQP(const struct mlx_modify_qp_req *req)
         ctx->ahTrafficClass = req->ahTrafficClass;
         ctx->ahUdpSport = req->ahUdpSport;
         ctx->destQpn = dqpn;
-        /* Encode the RoCE path into primary_address_path (ads@0xC0) */
-        encodePath(ctx, qpc + 0xC0);
+        struct MlxRocePathFields path = {};
+        memcpy(path.dmac, ctx->ahDmac, sizeof(path.dmac));
+        memcpy(path.dgid, ctx->ahDgid, sizeof(path.dgid));
+        path.sgidIndex = ctx->ahSgidIndex;
+        path.hopLimit = ctx->ahHopLimit;
+        path.trafficClass = ctx->ahTrafficClass;
+        path.udpSport = ctx->ahUdpSport;
+        path.pkeyIndex = ctx->pkeyIndex;
+        path.portNum = ctx->portNum;
+        if (!mlxEncodeInit2RtrQpc(qpc, MLX_QPC_BYTES, &path, dqpn,
+                                  req->pathMtu, req->rqPsn,
+                                  req->maxDestRdAtomic, &optParamMask)) {
+            IOLockUnlock(fLock);
+            return kIOReturnBadArgument;
+        }
     }
     if (opcode == MLX_CMD_OP_RTR2RTS_QP) {
-        /* sq_psn: next_send_psn@0x3C8 (note it is adjacent to pkey_index) */
-        mlxSetBits(qpc, 0x3c8, 24, req->sqPsn);
-        mlxSetBits(qpc, 0x4a3, 5, req->minRnrTimer);
+        if (!mlxEncodeRtr2RtsQpc(qpc, MLX_QPC_BYTES, req->sqPsn,
+                                 req->minRnrTimer, req->maxRdAtomic,
+                                 &optParamMask)) {
+            IOLockUnlock(fLock);
+            return kIOReturnBadArgument;
+        }
     }
+
+    mlxSetBits(in, 0x80, 32, optParamMask);
 
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out), opcode };
     kern_return_t kr = fRoce->getCore()->exec(opcode, in, sizeof(in),
@@ -327,33 +351,6 @@ kern_return_t MlxQP::modifyQP(const struct mlx_modify_qp_req *req)
         ctx->state = req->newState;
     IOLockUnlock(fLock);
     return kr;
-}
-
-/* Encode the RoCE path into ads (see mlx5_set_path, qp.c:3583)
- * ads layout (mlx5_ifc.h:780):
- *   src_addr_index@0x00, hop_limit@0x08, tclass@0x0C, flow_label@0x10,
- *   rgid_rip@0x14, dscp@0x78(6bit), udp_sport@0x7C, eth_prio@0x80 */
-void MlxQP::encodePath(MlxQPContext *qp, void *ads)
-{
-    if (!qp || !ads)
-        return;
-    uint8_t *a = (uint8_t *)ads;
-    /* src_addr_index (source GID table index) */
-    a[0x00] = (uint8_t)(qp->ahSgidIndex & 0xFF);
-    /* hop_limit (TTL) */
-    a[0x08] = qp->ahHopLimit ? qp->ahHopLimit : 64;
-    /* tclass (DSCP + ECN) */
-    a[0x0C] = qp->ahTrafficClass | MLX_AV_ECN_ENABLED;
-    /* destination GID (remote IP) */
-    memcpy(a + 0x14, qp->ahDgid, 16);
-    /* destination MAC (rmac_47_32 in the ads +0x70 area) */
-    memcpy(a + 0x70, qp->ahDmac, 6);
-    /* dscp@0x78 (6bit): tclass>>2 */
-    a[0x78] = (uint8_t)((qp->ahTrafficClass >> 2) & 0x3F);
-    /* udp_sport@0x7C */
-    OSWriteBigInt16(a, 0x7C, qp->ahUdpSport);
-    /* eth_prio@0x80 (3bit) */
-    a[0x80] = (uint8_t)((a[0x80] & 0xF8) | 0);
 }
 
 MlxQPContext *MlxQP::ctxForQpn(uint32_t qpn)

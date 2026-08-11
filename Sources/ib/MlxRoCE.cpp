@@ -79,12 +79,18 @@ bool MlxRoCE::start(IOService *provider)
         IOLog("MlxRoCE: provider is not the core layer\n");
         return false;
     }
+    if (!fCore->rocePublicationAllowed()) {
+        IOLog("MlxRoCE: userspace ABI is not enabled; refusing publication\n");
+        fCore = NULL;
+        return false;
+    }
     fCore->retain();
     fHCA = fCore->getHCA();
 
     /* Staged initialization (see pf_profile, main.c:4287) */
     if (!stageInit() || !stageCaps() || !stageGID() || !stageDevRes()) {
         IOLog("MlxRoCE: initialization failed\n");
+        cleanupResources();
         return false;
     }
 
@@ -98,6 +104,12 @@ bool MlxRoCE::start(IOService *provider)
 }
 
 void MlxRoCE::stop(IOService *provider)
+{
+    cleanupResources();
+    super::stop(provider);
+}
+
+void MlxRoCE::cleanupResources()
 {
     /* Unregister EQ event subscriptions */
     MlxEQ *eq = fCore ? fCore->getEQ() : NULL;
@@ -124,17 +136,11 @@ void MlxRoCE::stop(IOService *provider)
     if (fMrTable) { fMrTable->release(); fMrTable = NULL; }
     if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     if (fCore) { fCore->release(); fCore = NULL; }
-    super::stop(provider);
 }
 
 void MlxRoCE::free()
 {
-    if (fQpTable) { fQpTable->release(); fQpTable = NULL; }
-    if (fCqTable) { fCqTable->release(); fCqTable = NULL; }
-    if (fMrTable) { fMrTable->release(); fMrTable = NULL; }
-    if (fEventLock) { IOLockFree(fEventLock); fEventLock = NULL; }
-    if (fResourceLock) { IOLockFree(fResourceLock); fResourceLock = NULL; }
-    if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
+    cleanupResources();
     super::free();
 }
 
@@ -149,7 +155,8 @@ bool MlxRoCE::stageInit()
     fEventLock = IOLockAlloc();
     fEventHead = 0;
     fEventTail = 0;
-    if (!fResourceLock || !fQpTable || !fCqTable || !fMrTable || !fEventLock)
+    if (!fResourceLock || !fWorkLoop || !fQpTable || !fCqTable ||
+        !fMrTable || !fEventLock)
         return false;
     return true;
 }
@@ -182,7 +189,9 @@ bool MlxRoCE::stageGID()
     /* Write the default IPv6 link-local GID (see rdma.c:131 mlx5_rdma_add_roce_addr) */
     uint8_t gid[16], mac[6];
     fGID->getLocalAddr(gid, mac);
-    fGID->setGID(0, gid, mac, MLX_ROCE_VERSION_1, 0, false, 0);
+    if (fGID->setGID(0, gid, mac, MLX_ROCE_VERSION_1, 0, false, 0) !=
+        kIOReturnSuccess)
+        return false;
     fGID->startAddressMonitor();
     return true;
 }
@@ -209,16 +218,16 @@ bool MlxRoCE::stageDevRes()
 
     /* Subscribe to EQ events (see mlx5_ib_stage_dev_notifier_init, main.c:4195) */
     MlxEQ *eq = fCore->getEQ();
-    if (eq) {
-        eq->registerNotifier(MLX_EVENT_TYPE_WQ_CATAS_ERROR, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_PATH_MIG, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_COMM_EST, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_COMPLETION, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_DEVICE_FATAL, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_GID_CHANGE, this);
-        eq->registerNotifier(MLX_EVENT_TYPE_CLIENT_REREGISTER, this);
-    }
+    if (!eq)
+        return false;
+    eq->registerNotifier(MLX_EVENT_TYPE_WQ_CATAS_ERROR, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_PATH_MIG, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_COMM_EST, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_COMPLETION, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_DEVICE_FATAL, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_GID_CHANGE, this);
+    eq->registerNotifier(MLX_EVENT_TYPE_CLIENT_REREGISTER, this);
     return true;
 }
 

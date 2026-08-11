@@ -21,3 +21,5 @@ DerivedData/
 # 系统
 .DS_Store
 *.dSYM
+__pycache__/
+*.pyc

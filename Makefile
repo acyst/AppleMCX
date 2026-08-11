@@ -9,9 +9,11 @@ VERSION    := 0.1.0
 # 自动检测宿主架构 (Apple Silicon → arm64e, Intel → x86_64)
 HOST_ARCH := $(shell uname -m)
 ARCH      ?= $(if $(filter arm64%, $(HOST_ARCH)), arm64e, x86_64)
+ifeq ($(shell uname -s),Darwin)
 SDK         := $(shell xcrun --sdk macosx --show-sdk-path)
-CXX        := $(shell xcrun -sdk macosx -find clang++)
+CXX         := $(shell xcrun -sdk macosx -find clang++)
 CC          := $(shell xcrun -sdk macosx -find clang)
+endif
 
 # ---- 源文件 ----
 SRC_CORE   := $(wildcard Sources/core/*.cpp)
@@ -50,7 +52,7 @@ LDFLAGS := -arch $(ARCH) -nostdlib -Wl,-kext \
     $(if $(KEXT_STUB),-lcc_kext -lcplusplus,-undefined dynamic_lookup)
 
 # ---- 目标 ----
-.PHONY: all clean load unload sign deploy status tools pkg kext-pkg
+.PHONY: all clean load unload sign deploy status tools pkg kext-pkg check check-host
 
 all: AppleMCX.kext/Contents/MacOS/$(KEXT_NAME) AppleMCX.kext/Contents/Info.plist
 
@@ -109,6 +111,17 @@ unload:
 status:
 	kextstat | grep -i mlx || echo "驱动未加载"
 	ioreg -l | grep -i mlx || echo "设备树中无 Mlx 节点"
+
+check: check-host
+
+check-host:
+	@mkdir -p build/tests
+	clang++ -std=c++17 -Wall -Wextra -Werror \
+	    -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -ISources/hw Tests/host/test_p0_encoding.cpp \
+	    -o build/tests/test_p0_encoding
+	./build/tests/test_p0_encoding
+	python3 Tests/host/test_p0_policy.py
 
 clean:
 	rm -rf obj build AppleMCX.kext/Contents/MacOS/$(KEXT_NAME)

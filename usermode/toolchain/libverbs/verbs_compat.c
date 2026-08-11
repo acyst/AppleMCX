@@ -197,11 +197,8 @@ struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
     if (!pd || !pd->context || !pd->context->mlx_ctx ||
         !pd->mlx_pd || !addr)
         return NULL;
-    /* Convert access flags to libmlx */
-    uint32_t flags = 0;
-    if (access & IBV_ACCESS_LOCAL_WRITE) flags |= 0x2;
-    if (access & IBV_ACCESS_REMOTE_WRITE) flags |= 0x8;
-    if (access & IBV_ACCESS_REMOTE_READ) flags |= 0x4;
+    /* The user ABI uses the standard low four ibv_access_flags bits. */
+    uint32_t flags = (uint32_t)access & 0x0f;
     struct mlx_reg_mr_resp resp;
     struct mlx_mr *mlxMr = mlx_reg_mr(pd->mlx_pd, addr, length, flags, &resp);
     if (!mlxMr)
@@ -342,13 +339,13 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 {
     if (!qp || !attr)
         return -1;
-    (void)attr_mask;
     int old_state = qp->state;
 
     /* State machine driven via libmlx (RST->INIT->RTR->RTS) */
     if (qp->mlx_qp) {
         struct mlx_modify_qp_req req;
         memset(&req, 0, sizeof(req));
+        req.attrMask = (uint32_t)attr_mask;
         /* curState: inferred from the previous qp->state (MVP: sequential calls) */
         uint32_t cur = (old_state == IBV_QPS_RESET) ? 0 :
                        (old_state == IBV_QPS_INIT) ? 1 :
@@ -371,6 +368,7 @@ int ibv_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
             req.ahHopLimit = attr->ah_attr.grh.hop_limit;
             req.ahTrafficClass = attr->ah_attr.grh.traffic_class;
             req.ahUdpSport = 0;   /* default assigned by kernel */
+            req.portNum = attr->ah_attr.port_num;
         }
         int rc = mlx_modify_qp(qp->mlx_qp, cur, attr->qp_state, &req);
         if (rc)

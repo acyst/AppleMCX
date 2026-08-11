@@ -49,6 +49,8 @@ struct MlxQPContext {
     uint8_t     ahHopLimit;
     uint8_t     ahTrafficClass;
     uint16_t    ahUdpSport;
+    uint16_t    pkeyIndex;
+    uint8_t     portNum;
     uint32_t    destQpn;
     uint32_t    rqPsn;
     uint32_t    sqPsn;
@@ -87,9 +89,6 @@ private:
     kern_return_t stateTransition(MlxQPContext *qp,
                                   uint32_t cur, uint32_t newState,
                                   const struct mlx_modify_qp_req *req);
-
-    /* RoCE path encoding (see mlx5_set_path, qp.c:3583) */
-    void encodePath(MlxQPContext *qp, void *ads);
 
     /* Helper: find by qpn (internal) */
     MlxQPContext *ctxForQpn(uint32_t qpn);

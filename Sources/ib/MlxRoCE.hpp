@@ -76,6 +76,7 @@ private:
     bool stageCaps();
     bool stageGID();
     bool stageDevRes();
+    void cleanupResources();
 
     /* event handling (see mlx5_ib_event, main.c:2743) */
     virtual void handleEvent(uint32_t type, void *eqe) APPLE_KEXT_OVERRIDE;

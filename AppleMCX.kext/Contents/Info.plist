@@ -87,7 +87,7 @@
 			<key>IOMatchCategory</key>
 			<string>MlxRoCE</string>
 			<key>IOProviderClass</key>
-			<string>IOService</string>
+			<string>MlxPCIDriver</string>
 			<key>IOResourceMatch</key>
 			<string>IOKit</string>
 			<key>IOPropertyMatch</key>
