@@ -105,6 +105,13 @@ int mlx_post_recv(mlx_qp *qp, void *buf, uint32_t length, uint32_t lkey,
  */
 int mlx_poll_cq(mlx_cq *cq, struct MlxCqe64 *cqe, int num);
 
+/*
+ * update_cq_consumer - tell the kernel the new CQ consumer index
+ * The DB record page is not directly mapped to userspace; consumer
+ * index updates are kernel-mediated.
+ */
+int mlx_update_cq_consumer(mlx_cq *cq, uint32_t consumerIndex);
+
 /* Query completion count (used by ibv_get_cq_event) */
 int mlx_query_cq_completions(mlx_context *ctx, uint32_t cqHandle,
                              uint64_t *count);

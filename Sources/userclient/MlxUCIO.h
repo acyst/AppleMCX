@@ -99,6 +99,15 @@ enum {
 
     /* async events */
     kMlxUCMethodGetAsyncEvent = 0x1093,  /* get an async event (non-blocking) */
+
+    /* CQ consumer index update (kernel-mediated, replaces direct DB record write) */
+    kMlxUCMethodUpdateCqConsumer = 0x1094,
+};
+
+/* updateCqConsumer request: tell the kernel the new consumer index for a CQ */
+struct mlx_update_cq_consumer_req {
+    uint32_t  cqHandle;
+    uint32_t  consumerIndex;
 };
 
 /* async event (see rdma-core ibv_async_event) */

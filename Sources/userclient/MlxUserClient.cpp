@@ -204,7 +204,7 @@ IOReturn MlxUserClient::clientMemoryForType(UInt32 type,
                 fRoce->getCQ()->getCqMemDesc(fActiveCq);
             if (desc) {
                 *memory = desc;
-                *options = 0;
+                *options = kIOMapReadOnly;
                 return kIOReturnSuccess;
             }
         }
@@ -263,6 +263,8 @@ const IOExternalMethodDispatch MlxUserClient::sMethods[] = {
     /* async events */
     MLX_METHOD(kMlxUCMethodGetAsyncEvent, sGetAsyncEvent, 0,
                sizeof(struct mlx_async_event)),
+    MLX_METHOD(kMlxUCMethodUpdateCqConsumer, sUpdateCqConsumer,
+               sizeof(struct mlx_update_cq_consumer_req), 0),
 };
 
 IOReturn MlxUserClient::externalMethod(uint32_t selector,
@@ -288,6 +290,7 @@ IOReturn MlxUserClient::externalMethod(uint32_t selector,
         { kMlxUCMethodQueryHealth, 20 }, { kMlxUCMethodVirtToPhys, 21 },
         { kMlxUCMethodQueryCqCompletions, 22 },
         { kMlxUCMethodGetAsyncEvent, 23 },
+        { kMlxUCMethodUpdateCqConsumer, 24 },
     };
     for (uint32_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
         if (map[i].selector != selector)
@@ -626,6 +629,17 @@ IOReturn MlxUserClient::sGetAsyncEvent(OSObject *t, void *ref,
         (struct mlx_async_event *)args->structureOutput);
 }
 
+IOReturn MlxUserClient::sUpdateCqConsumer(OSObject *t, void *ref,
+                                           IOExternalMethodArguments *args)
+{
+    MlxUserClient *self = (MlxUserClient *)t;
+    if (!args->structureInput)
+        return kIOReturnBadArgument;
+    struct mlx_update_cq_consumer_req *req =
+        (struct mlx_update_cq_consumer_req *)args->structureInput;
+    return self->updateCqConsumer(req->cqHandle, req->consumerIndex);
+}
+
 /* ---- internal implementations ---- */
 
 IOReturn MlxUserClient::queryDevice(struct mlx_query_device_resp *resp)
@@ -708,6 +722,16 @@ IOReturn MlxUserClient::destroyCQ(uint32_t cqHandle)
     if (kr != kIOReturnSuccess) addOwned(fOwnedCq, cqHandle);
     if (kr == kIOReturnSuccess && fActiveCq == cqHandle) fActiveCq = 0;
     return kr;
+}
+
+IOReturn MlxUserClient::updateCqConsumer(uint32_t cqHandle,
+                                          uint32_t consumerIndex)
+{
+    if (!fRoce)
+        return kIOReturnNotReady;
+    if (!owns(fOwnedCq, cqHandle))
+        return kIOReturnNotPermitted;
+    return fRoce->getCQ()->updateCqConsumer(cqHandle, consumerIndex);
 }
 
 IOReturn MlxUserClient::regMR(const struct mlx_reg_mr_req *req,

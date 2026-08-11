@@ -168,6 +168,12 @@ bool MlxEthernet::start(IOService *provider)
 
 void MlxEthernet::stop(IOService *provider)
 {
+    releaseResources();
+    super::stop(provider);
+}
+
+void MlxEthernet::releaseResources()
+{
     if (fNic) {
         detachInterface(fNic, true);
         fNic->release();
@@ -186,11 +192,11 @@ void MlxEthernet::stop(IOService *provider)
         fCore->release();
         fCore = NULL;
     }
-    super::stop(provider);
 }
 
 void MlxEthernet::free()
 {
+    releaseResources();
     if (fLock) {
         IOLockFree(fLock);
         fLock = NULL;

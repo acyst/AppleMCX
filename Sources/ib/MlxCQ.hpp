@@ -67,6 +67,11 @@ public:
     /* Query the CQ completion count (used by userspace ibv_get_cq_event) */
     uint64_t getCompletions(uint32_t cqHandle);
 
+    /* Update the CQ consumer index in the DB record (kernel-mediated)
+     * Called by userspace after polling CQEs, so hardware knows which
+     * entries have been consumed and can be overwritten. */
+    kern_return_t updateCqConsumer(uint32_t cqHandle, uint32_t consumerIndex);
+
 private:
     /* CREATE_CQ command (see create_cq_user, cq.c:717) */
     kern_return_t cmdCreateCQ(MlxCQContext *cq, uint32_t eqNumber);

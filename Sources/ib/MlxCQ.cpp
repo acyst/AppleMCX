@@ -329,3 +329,38 @@ uint64_t MlxCQ::getCompletions(uint32_t cqHandle)
     IOLockUnlock(fLock);
     return completions;
 }
+
+kern_return_t MlxCQ::updateCqConsumer(uint32_t cqHandle,
+                                       uint32_t consumerIndex)
+{
+    /* Write the consumer index to the DB record page so hardware knows
+     * which CQEs have been consumed. See mlx5_cq_set_ci (cq.c).
+     * The DB record is kernel DMA-coherent memory; userspace cannot
+     * write it directly (the mapping is not exposed). The write is
+     * done under fLock to avoid racing with destroyCQ. */
+    if (!fRoce || !fRoce->getCore() || !fRoce->getCore()->getUAR())
+        return kIOReturnNotReady;
+    uint32_t *db = fRoce->getCore()->getUAR()->getDbRecord();
+    if (!db)
+        return kIOReturnNotReady;
+    kern_return_t ret = kIOReturnNotFound;
+    IOLockLock(fLock);
+    for (uint32_t i = 0; i < fCqTable->getCount(); i++) {
+        MlxCQContext *ctx = mlxRecordValue<MlxCQContext>(
+            fCqTable->getObject(i));
+        if (!ctx || ctx->cqNumber != cqHandle)
+            continue;
+        uint32_t depth = 1u << ctx->logSize;
+        if (consumerIndex > depth * 2) {
+            ret = kIOReturnBadArgument;
+            break;
+        }
+        uint32_t slot = ctx->dbRecordOffset / sizeof(uint32_t);
+        db[slot] = OSSwapHostToBigInt32(consumerIndex);
+        mlxMemoryBarrier();
+        ret = kIOReturnSuccess;
+        break;
+    }
+    IOLockUnlock(fLock);
+    return ret;
+}

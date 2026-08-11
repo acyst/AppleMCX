@@ -59,6 +59,8 @@ public:
     MlxPCIDriver *getCore() { return fCore; }
 
 private:
+    void releaseResources();
+
     /* TX: build a WQE and write it to the SQ (see mlx5e_xmit, en_tx.c:666) */
     kern_return_t xmitPacket(mbuf_t packet);
     kern_return_t xmitInline(mbuf_t packet);

@@ -93,6 +93,9 @@ public:
     /* async events */
     static IOReturn sGetAsyncEvent(OSObject *t, void *ref,
                                    IOExternalMethodArguments *args);
+    /* CQ consumer index update */
+    static IOReturn sUpdateCqConsumer(OSObject *t, void *ref,
+                                      IOExternalMethodArguments *args);
 
 private:
     void cleanup();
@@ -111,6 +114,7 @@ private:
     IOReturn createCQ(uint32_t entries,
                       struct mlx_create_cq_resp *resp);
     IOReturn destroyCQ(uint32_t cqHandle);
+    IOReturn updateCqConsumer(uint32_t cqHandle, uint32_t consumerIndex);
     IOReturn regMR(const struct mlx_reg_mr_req *req,
                    struct mlx_reg_mr_resp *resp);
     IOReturn deregMR(uint32_t mrHandle);

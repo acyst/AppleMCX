@@ -40,12 +40,10 @@ struct mlx_pd {
 struct mlx_cq {
     mlx_context *ctx;
     uint32_t    cqHandle;
-    struct MlxCqe64 *cqeBuf;   /* usermode CQ buffer */
+    struct MlxCqe64 *cqeBuf;   /* usermode CQ buffer (read-only mmap) */
     uint32_t    logSize;
     uint32_t    consIndex;
     int         cqeMapped;
-    uint32_t   *dbRecord;
-    mach_vm_address_t dbMap;
 };
 
 struct mlx_qp {
@@ -342,24 +340,9 @@ mlx_cq *mlx_create_cq(mlx_context *ctx, uint32_t cqe, uint32_t *cqHandle)
         free(cq);
         return NULL;
     }
-    mach_vm_address_t dbMap = 0;
-    mach_vm_size_t dbSize = 0;
-    kr = IOConnectMapMemory(ctx->conn, kMlxUCMemIndexDbRecord,
-                            mach_task_self(), &dbMap, &dbSize,
-                            kIOMapAnywhere);
-    if (kr != kIOReturnSuccess || !dbMap ||
-        resp.dbRecordOffset + 2 * sizeof(uint32_t) > dbSize) {
-        if (cq->cqeMapped)
-            IOConnectUnmapMemory(ctx->conn, kMlxUCMemIndexCqe,
-                                 mach_task_self(),
-                                 (mach_vm_address_t)(uintptr_t)cq->cqeBuf);
-        IOConnectCallStructMethod(ctx->conn, kMlxUCMethodDestroyCQ,
-                                  &cq->cqHandle, 4, NULL, 0);
-        free(cq);
-        return NULL;
-    }
-    cq->dbMap = dbMap;
-    cq->dbRecord = (uint32_t *)(uintptr_t)(dbMap + resp.dbRecordOffset);
+    /* CQ consumer index updates go through a kernel-mediated control
+     * method (kMlxUCMethodUpdateCqConsumer); the DB record page is
+     * not directly mapped to userspace. */
     return cq;
 }
 
@@ -373,9 +356,6 @@ void mlx_destroy_cq(mlx_cq *cq)
     if (cq->cqeMapped)
         IOConnectUnmapMemory(cq->ctx->conn, kMlxUCMemIndexCqe,
                              mach_task_self(), (mach_vm_address_t)(uintptr_t)cq->cqeBuf);
-    if (cq->dbMap)
-        IOConnectUnmapMemory(cq->ctx->conn, kMlxUCMemIndexDbRecord,
-                             mach_task_self(), cq->dbMap);
 #endif
     free(cq);
 }
@@ -669,6 +649,24 @@ int mlx_post_recv(mlx_qp *qp, void *buf, uint32_t length, uint32_t lkey,
 }
 
 /*
+ * update_cq_consumer - tell the kernel the new CQ consumer index
+ * The DB record page is not exposed to userspace; consumer index
+ * updates go through a kernel-mediated control method.
+ */
+int mlx_update_cq_consumer(mlx_cq *cq, uint32_t consumerIndex)
+{
+    if (!cq)
+        return EINVAL;
+    struct mlx_update_cq_consumer_req req;
+    req.cqHandle = cq->cqHandle;
+    req.consumerIndex = consumerIndex;
+    kern_return_t kr = IOConnectCallStructMethod(
+        cq->ctx->conn, kMlxUCMethodUpdateCqConsumer, &req, sizeof(req),
+        NULL, 0);
+    return kr == kIOReturnSuccess ? 0 : EIO;
+}
+
+/*
  * poll_cq - reads the CQE buffer directly (See cq.c:609)
  */
 int mlx_poll_cq(mlx_cq *cq, struct MlxCqe64 *cqe, int num)
@@ -690,10 +688,10 @@ int mlx_poll_cq(mlx_cq *cq, struct MlxCqe64 *cqe, int num)
         cqe[i].flags_rqpn = __builtin_bswap32(cqe[i].flags_rqpn);
         cqe[i].sop_drop_qpn = __builtin_bswap32(cqe[i].sop_drop_qpn);
         cq->consIndex++;
-        if (cq->dbRecord)
-            *cq->dbRecord = host_to_be32(cq->consIndex);
         got++;
     }
+    if (got > 0)
+        mlx_update_cq_consumer(cq, cq->consIndex);
     return got;
 }
 
