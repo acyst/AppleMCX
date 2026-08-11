@@ -105,6 +105,21 @@ enum {
     MLX_CMD_OP_QUERY_CONG_PARAMS      = 0x826,
     MLX_CMD_OP_QUERY_CONG_STATUS      = 0x827,
     MLX_CMD_OP_QUERY_CONG_STATISTICS  = 0x828,
+    /* mlx5e NIC data path (See mlx5_ifc.h command opcodes) */
+    MLX_CMD_OP_ALLOC_PD                = 0x800,
+    MLX_CMD_OP_DEALLOC_PD              = 0x801,
+    MLX_CMD_OP_ALLOC_TRANSPORT_DOMAIN  = 0x816,
+    MLX_CMD_OP_DEALLOC_TRANSPORT_DOMAIN = 0x817,
+    MLX_CMD_OP_CREATE_TIR              = 0x900,
+    MLX_CMD_OP_DESTROY_TIR             = 0x902,
+    MLX_CMD_OP_CREATE_SQ               = 0x904,
+    MLX_CMD_OP_DESTROY_SQ              = 0x906,
+    MLX_CMD_OP_CREATE_RQ               = 0x908,
+    MLX_CMD_OP_DESTROY_RQ              = 0x90a,
+    MLX_CMD_OP_CREATE_TIS              = 0x912,
+    MLX_CMD_OP_DESTROY_TIS             = 0x914,
+    MLX_CMD_OP_CREATE_RQT              = 0x916,
+    MLX_CMD_OP_DESTROY_RQT             = 0x918,
 };
 
 /*
