@@ -367,7 +367,7 @@ kern_return_t MlxQP::destroyQP(uint32_t qpn)
     uint8_t in[16] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_QP);
-    OSWriteBigInt32(in, 4, qpn);
+    mlxSetBits(in, 0x48, 24, qpn);
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
                         MLX_CMD_OP_DESTROY_QP };
     kern_return_t kr = fRoce->getCore()->exec(MLX_CMD_OP_DESTROY_QP,

@@ -38,8 +38,9 @@ free_eq_entry(MlxEqEntry *eq)
     eq->ringBuf = NULL;
 }
 
-void MlxEQ::shutdown()
+bool MlxEQ::shutdown()
 {
+    bool allDestroyed = true;
     if (fAsyncIS) {
         fAsyncIS->disable();
         if (fWorkLoop) fWorkLoop->removeEventSource(fAsyncIS);
@@ -59,17 +60,39 @@ void MlxEQ::shutdown()
 
     if (fOwner && fOwner->getCmd() && fOwner->getCmd()->isUp()) {
         for (uint32_t i = 0; i < fNumCompEqs; i++) {
-            if (fCompEqs && fCompEqs[i].eqNumber) {
-                destroyEq(fCompEqs[i].eqNumber);
-                fCompEqs[i].eqNumber = 0;
+            if (fCompEqs && fCompEqs[i].valid) {
+                if (destroyEq(fCompEqs[i].eqNumber) == kIOReturnSuccess)
+                    fCompEqs[i].valid = false;
+                else
+                    allDestroyed = false;
             }
         }
         for (uint32_t i = 0; i < fNumAsyncEqs; i++) {
-            if (fAsyncEqs && fAsyncEqs[i].eqNumber) {
-                destroyEq(fAsyncEqs[i].eqNumber);
-                fAsyncEqs[i].eqNumber = 0;
+            if (fAsyncEqs && fAsyncEqs[i].valid) {
+                if (destroyEq(fAsyncEqs[i].eqNumber) == kIOReturnSuccess)
+                    fAsyncEqs[i].valid = false;
+                else
+                    allDestroyed = false;
             }
         }
+    } else {
+        for (uint32_t i = 0; i < fNumCompEqs; i++)
+            allDestroyed &= !fCompEqs || !fCompEqs[i].valid;
+        for (uint32_t i = 0; i < fNumAsyncEqs; i++)
+            allDestroyed &= !fAsyncEqs || !fAsyncEqs[i].valid;
+    }
+    return allDestroyed;
+}
+
+void MlxEQ::markHardwareStopped()
+{
+    for (uint32_t i = 0; i < fNumCompEqs; i++) {
+        if (fCompEqs)
+            fCompEqs[i].valid = false;
+    }
+    for (uint32_t i = 0; i < fNumAsyncEqs; i++) {
+        if (fAsyncEqs)
+            fAsyncEqs[i].valid = false;
     }
 }
 
@@ -77,14 +100,18 @@ void MlxEQ::free()
 {
     shutdown();
     if (fCompEqs) {
-        for (uint32_t i = 0; i < fNumCompEqs; i++)
-            free_eq_entry(&fCompEqs[i]);
+        for (uint32_t i = 0; i < fNumCompEqs; i++) {
+            if (!fCompEqs[i].valid)
+                free_eq_entry(&fCompEqs[i]);
+        }
         IOFree(fCompEqs, sizeof(MlxEqEntry) * fNumCompEqs);
         fCompEqs = NULL;
     }
     if (fAsyncEqs) {
-        for (uint32_t i = 0; i < fNumAsyncEqs; i++)
-            free_eq_entry(&fAsyncEqs[i]);
+        for (uint32_t i = 0; i < fNumAsyncEqs; i++) {
+            if (!fAsyncEqs[i].valid)
+                free_eq_entry(&fAsyncEqs[i]);
+        }
         IOFree(fAsyncEqs, sizeof(MlxEqEntry) * fNumAsyncEqs);
         fAsyncEqs = NULL;
     }
@@ -148,9 +175,8 @@ bool MlxEQ::init(MlxPCIDriver *owner, uint32_t numCompVectors)
 
 kern_return_t MlxEQ::allocEqBuf(MlxEqEntry *eq)
 {
-    /* Allocate the EQ ring buffer (64B EQE * depth + spares). */
-    uint32_t sizeBytes = (1u << eq->logSize) + MLX_NUM_SPARE_EQE;
-    sizeBytes *= sizeof(MlxEqe);
+    /* The PAS geometry must describe exactly the depth reported in EQC. */
+    uint32_t sizeBytes = (1u << eq->logSize) * sizeof(MlxEqe);
     sizeBytes = (sizeBytes + 4095) & ~4095u;
 
     eq->fDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
@@ -213,13 +239,11 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
 
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_EQ);
 
-    /* eqc (See mlx5_ifc.h:4258 mlx5_ifc_eqc_bits, bitfield layout):
-     *   st[0x10](4bit) → bit 0x10 = byte 0x2 bit0, 4 bits → low nibble of byte 0x2
-     *   log_eq_size[0x63](5bit) → bit 0x63 = byte 0xC bit3, 5 bits → byte 0xC bits[7:3]
+    /* eqc (See mlx5_ifc.h mlx5_ifc_eqc_bits):
+     *   log_eq_size[0x63](5bit) → bit 0x63 = byte 0xC bit3
      *   uar_page[0x68](24bit) → bit 0x68 = byte 0xD bit0, 24 bits → bytes 0xD/0xE/0xF
      *   intr[0xB4](12bit) → bit 0xB4 = byte 0x16 bit4, 12 bits → byte 0x16 bits[7:4] + byte 0x17 */
     uint8_t *eqc = in + eqcOffset;
-    mlxSetBits(eqc, 0x10, 4, 0x4);
     mlxSetBits(eqc, 0x63, 5, eq->logSize);
     uint32_t uarPage = fOwner->getUAR() ? fOwner->getUAR()->getBootUarIndex() : 0;
     mlxSetBits(eqc, 0x68, 24, uarPage);
@@ -228,7 +252,7 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
 
     /* event_bitmask (128-bit) */
     for (uint32_t i = 0; i < 4; i++)
-        OSWriteBigInt64(in, maskOffset + (i * 8), mask[i]);
+        OSWriteBigInt32(in, maskOffset + (i * 4), mask[i]);
 
     /* PAS (physical address list, 8 bytes each) */
     uint32_t numPages = eq->numPages;
@@ -250,6 +274,7 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
     }
 
     eq->eqNumber = static_cast<uint32_t>(mlxGetBits(out, 0x58, 8));
+    eq->valid = true;
     eq->irqVector = vecidx;
     eq->doorbellOffset = MLX_EQ_DOORBELL;
     eq->consIndex = 0;
@@ -264,7 +289,7 @@ kern_return_t MlxEQ::destroyEq(uint32_t eqNumber)
     uint8_t in[16] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_EQ);
-    OSWriteBigInt32(in, 4, eqNumber);
+    mlxSetBits(in, 0x58, 8, eqNumber);
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
                         MLX_CMD_OP_DESTROY_EQ };
     return fOwner->getCmd()->exec(&cmd, 5000);

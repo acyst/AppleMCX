@@ -19,12 +19,15 @@
 #include "MlxWQE.hpp"
 #include "MlxUCIO.h"
 #include "MlxEQ.hpp"   /* MlxEventNotifier: Ethernet subscribes to completion events */
+#include "MlxUAR.hpp"
 
 /* mlx5e data-path sizing (See en.h MLX5E_PARAMS_*) */
 #define MLX5E_DEFAULT_LOG_SQ_SIZE  8      /* 256 WQEs */
 #define MLX5E_DEFAULT_LOG_RQ_SIZE  8      /* 256 WQEs */
 #define MLX5E_RX_BUF_SIZE         2048
+#define MLX5E_TX_BUF_SIZE         2048
 #define MLX5E_MAX_RX_BUFS          256
+#define MLX5E_INVALID_RESOURCE 0xffffffffu
 
 class MlxRoCE;
 class MlxPCIDriver;
@@ -72,25 +75,35 @@ private:
     void releaseResources();
 
     /* mlx5e resource creation/teardown (See mlx5e_open_locked, en_main.c) */
-    kern_return_t allocPdTd();
-    void deallocPdTd();
+    kern_return_t allocGlobalResources();
+    kern_return_t deallocGlobalResources();
     kern_return_t createTxResources();
     kern_return_t createRxResources();
-    void destroyTxResources();
-    void destroyRxResources();
+    kern_return_t destroyTxResources();
+    kern_return_t destroyRxResources();
 
     /* Low-level commands (See en_main.c / transobj.c) */
     kern_return_t cmdAllocTd(uint32_t *td);
     kern_return_t cmdAllocPd(uint32_t *pd);
+    kern_return_t cmdCreateMkey(uint32_t pd, uint32_t *mkeyIndex,
+                                uint32_t *lkey);
+    kern_return_t cmdDestroyObject(uint32_t opcode, uint32_t objectId);
     kern_return_t cmdCreateTis(uint32_t td, uint32_t pd, uint32_t *tisn);
     kern_return_t cmdCreateCq(uint32_t logSize, uint32_t *cqn, void **cqBuf,
                               IOBufferMemoryDescriptor **cqDesc,
-                              uint64_t *cqDMA, uint32_t *dbOffset);
+                              IODMACommand **cqMap, uint64_t *cqDMA,
+                              uint32_t *dbOffset);
     kern_return_t cmdDestroyCq(uint32_t cqn);
     kern_return_t cmdCreateSq(uint32_t tisn, uint32_t cqn, uint32_t *sqn,
                               uint32_t *dbOffset);
     kern_return_t cmdCreateRq(uint32_t cqn, uint32_t *rqn, uint32_t *dbOffset);
     kern_return_t cmdCreateTir(uint32_t rqn, uint32_t td, uint32_t *tirn);
+    kern_return_t cmdModifySqReady(uint32_t sqn);
+    kern_return_t cmdModifyRqReady(uint32_t rqn);
+    kern_return_t createRxFlowSteering();
+    kern_return_t destroyRxFlowSteering();
+    kern_return_t queryMacAddress(uint8_t mac[6]);
+    bool queryLinkState();
 
     /* TX: build a WQE and write it to the SQ (see mlx5e_xmit, en_tx.c:666) */
     kern_return_t xmitPacket(mbuf_t packet);
@@ -104,6 +117,9 @@ private:
     void pollTxCq();
     void pollRxCq();
     kern_return_t postRxWqe(uint16_t index);
+    void updateCqConsumer(uint32_t dbOffset, uint32_t consumer);
+    void armCq(uint32_t cqn, uint32_t dbOffset, uint32_t armSn,
+               uint32_t consumer);
 
     MlxPCIDriver    *fCore;
     MlxRoCE         *fRoce;
@@ -115,6 +131,7 @@ private:
     bool             fLinkUp;
     UInt32           fLinkSpeed;      /* Mbps */
     uint8_t          fMacAddr[6];
+    uint8_t          fTxMinInlineMode;
     IOLock          *fLock;
 
     /* mlx5e resources (See struct mlx5e_priv / mlx5e_txqsq) */
@@ -126,17 +143,27 @@ private:
     uint32_t         fTirn;
     uint32_t         fTxCqn;
     uint32_t         fRxCqn;
+    uint32_t         fMkeyIndex;
+    uint32_t         fLkey;
+    uint32_t         fFlowTableId;
+    uint32_t         fFlowGroupId;
     uint32_t         fTxDbOffset;     /* SQ doorbell record offset in UAR DB page */
     uint32_t         fRxDbOffset;     /* RQ doorbell record offset */
     uint32_t         fTxCqDbOffset;   /* TX CQ consumer DB offset */
     uint32_t         fRxCqDbOffset;   /* RX CQ consumer DB offset */
-    void            *fTxBf;           /* blue-flame doorbell register */
+    MlxBfreg         fTxBf;
+    bool             fTxBfValid;
     void            *fTxCqBuf;        /* TX CQ CQE buffer (kernel VA) */
     void            *fRxCqBuf;        /* RX CQ CQE buffer (kernel VA) */
     IOBufferMemoryDescriptor *fTxCqDesc;
+    IODMACommand    *fTxCqMap;
     uint64_t         fTxCqDMA;
     IOBufferMemoryDescriptor *fRxCqDesc;
+    IODMACommand    *fRxCqMap;
     uint64_t         fRxCqDMA;
+    IOBufferMemoryDescriptor *fTxBufDesc;   /* TX bounce-buffer pool */
+    IODMACommand    *fTxBufMap;
+    uint64_t         fTxBufDMA;
     IOBufferMemoryDescriptor *fRxBufDesc;   /* RX buffer pool (DMA) */
     IODMACommand *fRxBufMap;               /* RX buffer pool DMA map */
     uint64_t         fRxBufDMA;
@@ -144,6 +171,14 @@ private:
     uint16_t         fTxCc;           /* SQ consumer counter */
     uint16_t         fRxPc;           /* RQ producer counter */
     uint16_t         fRxCc;           /* RQ consumer counter */
+    uint32_t         fTxCqCc;
+    uint32_t         fRxCqCc;
+    uint32_t         fTxArmSn;
+    uint32_t         fRxArmSn;
+    bool             fFlowRootActive;
+    bool             fFlowEntryValid;
+    bool             fEnabling;
+    bool             fDisabling;
     bool             fNotifierRegistered;
 };
 

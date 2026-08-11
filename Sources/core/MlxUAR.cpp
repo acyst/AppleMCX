@@ -145,8 +145,7 @@ kern_return_t MlxUAR::cmdAllocUar(uint32_t *index)
     kern_return_t kr = fOwner->getCmd()->exec(&cmd, 5000);
     if (kr != kIOReturnSuccess)
         return kr;
-    /* Response uar field (offset 4) */
-    *index = OSReadBigInt32(out, 4) & 0xFFFFFF;
+    *index = static_cast<uint32_t>(mlxGetBits(out, 0x48, 24));
     return kIOReturnSuccess;
 }
 
@@ -155,7 +154,7 @@ kern_return_t MlxUAR::cmdFreeUar(uint32_t index)
     uint8_t in[16] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_FREE_UAR);
-    OSWriteBigInt32(in, 4, index);
+    mlxSetBits(in, 0x48, 24, index);
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
                         MLX_CMD_OP_FREE_UAR };
     return fOwner->getCmd()->exec(&cmd, 5000);
@@ -251,7 +250,8 @@ kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
     dbi = __builtin_ctz(free);
     fUarBitmap |= (1u << dbi);
 
-    bfreg->offset = MLX_BF_OFFSET + (dbi << 12);
+    uint32_t stride = 1u << fOwner->getHCA()->caps().logBfRegSize;
+    bfreg->offset = MLX_BF_OFFSET + dbi * stride;
     if (!fUarMap || bfreg->offset + sizeof(uint64_t) > 4096) {
         fUarBitmap &= ~(1u << dbi);
         return kIOReturnNotReady;
@@ -264,10 +264,12 @@ kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
 
 void MlxUAR::freeBfreg(MlxBfreg *bfreg)
 {
-    if (!bfreg || bfreg->offset < MLX_BF_OFFSET ||
-        ((bfreg->offset - MLX_BF_OFFSET) & 0xFFF))
+    if (!bfreg || bfreg->offset < MLX_BF_OFFSET)
         return;
-    uint32_t dbi = (bfreg->offset - MLX_BF_OFFSET) >> 12;
+    uint32_t stride = 1u << fOwner->getHCA()->caps().logBfRegSize;
+    if (!stride || (bfreg->offset - MLX_BF_OFFSET) % stride)
+        return;
+    uint32_t dbi = (bfreg->offset - MLX_BF_OFFSET) / stride;
     if (dbi >= 4)
         return;
     fUarBitmap &= ~(1u << dbi);

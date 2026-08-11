@@ -183,8 +183,21 @@ void MlxPCIDriver::cleanup()
         fHealth->release();
         fHealth = NULL;
     }
-    if (fEQ)
-        fEQ->shutdown();
+    bool eqDestroyed = !fEQ || fEQ->shutdown();
+    bool hcaStopped = eqDestroyed;
+    if (fCmd && fCmd->isUp()) {
+        /* Stop the HCA before releasing shared DMA/UAR memory. */
+        hcaStopped = teardownHca();
+        if (hcaStopped)
+            hcaStopped = disableHca();
+    }
+    if (!hcaStopped && fPci) {
+        /* A failed command teardown cannot be trusted as a DMA boundary. */
+        fPci->setBusMasterEnable(false);
+        hcaStopped = true;
+    }
+    if (!eqDestroyed && hcaStopped && fEQ)
+        fEQ->markHardwareStopped();
     if (fDMA) {
         fDMA->release();
         fDMA = NULL;
@@ -196,10 +209,6 @@ void MlxPCIDriver::cleanup()
     if (fUAR) {
         fUAR->release();
         fUAR = NULL;
-    }
-    if (fCmd && fCmd->isUp()) {
-        teardownHca();
-        disableHca();
     }
     if (fCmd) {
         fCmd->release();
@@ -313,7 +322,7 @@ bool MlxPCIDriver::setIssi()
         uint8_t setIn[16] = {};
         uint8_t setOut[16] = {};
         OSWriteBigInt16(setIn, 0, MLX_CMD_OP_SET_ISSI);
-        OSWriteBigInt32(setIn, 4, 1);          /* current_issi = 1 */
+        mlxSetBits(setIn, 0x50, 16, 1);        /* current_issi = 1 */
         MlxCmdInOut scmd = { setIn, sizeof(setIn), setOut, sizeof(setOut),
                              MLX_CMD_OP_SET_ISSI };
         kr = fCmd->exec(&scmd, 5000);
@@ -378,7 +387,7 @@ bool MlxPCIDriver::queryHcaCaps()
     uint8_t in[32] = {};
     uint8_t out[1024] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_QUERY_HCA_CAP);
-    OSWriteBigInt16(in, 2, 0);          /* op_mod: query current */
+    mlxSetBits(in, 0x30, 16, 1);        /* current general capability */
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
                         MLX_CMD_OP_QUERY_HCA_CAP };
     if (fCmd->exec(&cmd, 5000) != kIOReturnSuccess)
@@ -397,6 +406,7 @@ bool MlxPCIDriver::queryHcaCaps()
     caps.numPorts = static_cast<uint32_t>(mlxGetBits(cap, 0x1b8, 8));
     caps.roce = mlxGetBits(cap, 0x21e, 1) != 0;
     caps.uar4k = mlxGetBits(cap, 0x2a6, 1) != 0;
+    caps.logBfRegSize = static_cast<uint8_t>(mlxGetBits(cap, 0x26b, 5));
     caps.roceRwSupported = mlxGetBits(cap, 0x33f, 1) != 0;
     caps.roceMaxGid = static_cast<uint16_t>(mlxGetBits(cap, 0x170, 16));
     caps.roceVersions = caps.roce ? 0x3 : 0;
@@ -432,7 +442,7 @@ bool MlxPCIDriver::publishNubs()
      * See mlx5_register_device → add_adev (dev.c:306)
      * deviceName: multi-device identifier (mlx5_0/mlx5_1), enumerated by name in user space */
     setProperty("mlx_rdma", true);
-    setProperty("mlx_eth", false);
+    setProperty("mlx_eth", !fHCA->caps().isIB());
     setProperty("deviceName", fDevName);
     return true;
 }

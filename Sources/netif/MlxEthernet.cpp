@@ -13,6 +13,7 @@
 #include "MlxKernelCompat.hpp"
 #include "MlxCmd.hpp"
 #include "MlxDMA.hpp"
+#include "MlxDoorbell.hpp"
 #include "MlxRegs.hpp"
 
 #include <string.h>
@@ -43,9 +44,12 @@ bool MlxEthRing::init(uint32_t size, uint32_t wqebbSize)
     fHead = 0;
     fTail = 0;
     fWqBuf = NULL;
+    fWqDMA = 0;
     fWqDesc = NULL;
     fWqDmaMap = NULL;
     fDbRecord = NULL;
+    fDbDMA = 0;
+    memset(fWqeMbuf, 0, sizeof(fWqeMbuf));
     return true;
 }
 
@@ -82,14 +86,17 @@ void MlxEthRing::freeBuffers()
         fWqDesc->release();
         fWqDesc = NULL;
         fWqBuf = NULL;
+        fWqDMA = 0;
     }
+    fDbRecord = NULL;
+    fDbDMA = 0;
 }
 
 void MlxEthRing::updateDb(uint16_t head)
 {
     fHead = head;
     if (fDbRecord)
-        *fDbRecord = head;
+        *fDbRecord = OSSwapHostToBigInt32(head);
     mlxMemoryBarrier();
     /* The doorbell write (BF) is done in the xmit path */
 }
@@ -130,26 +137,37 @@ bool MlxEthernet::init(OSDictionary *properties)
     fLinkUp = false;
     fLinkSpeed = 0;
     memset(fMacAddr, 0, 6);
+    fTxMinInlineMode = 0;
     fLock = IOLockAlloc();
 
     /* mlx5e resources */
-    fPd = 0;
-    fTd = 0;
-    fTisn = 0;
-    fSqn = 0;
-    fRqn = 0;
-    fTirn = 0;
-    fTxCqn = 0;
-    fRxCqn = 0;
-    fTxDbOffset = 0;
-    fRxDbOffset = 0;
-    fTxCqDbOffset = 0;
-    fRxCqDbOffset = 0;
-    fTxBf = NULL;
+    fPd = MLX5E_INVALID_RESOURCE;
+    fTd = MLX5E_INVALID_RESOURCE;
+    fTisn = MLX5E_INVALID_RESOURCE;
+    fSqn = MLX5E_INVALID_RESOURCE;
+    fRqn = MLX5E_INVALID_RESOURCE;
+    fTirn = MLX5E_INVALID_RESOURCE;
+    fTxCqn = MLX5E_INVALID_RESOURCE;
+    fRxCqn = MLX5E_INVALID_RESOURCE;
+    fMkeyIndex = MLX5E_INVALID_RESOURCE;
+    fLkey = 0;
+    fFlowTableId = MLX5E_INVALID_RESOURCE;
+    fFlowGroupId = MLX5E_INVALID_RESOURCE;
+    fTxDbOffset = MLX5E_INVALID_RESOURCE;
+    fRxDbOffset = MLX5E_INVALID_RESOURCE;
+    fTxCqDbOffset = MLX5E_INVALID_RESOURCE;
+    fRxCqDbOffset = MLX5E_INVALID_RESOURCE;
+    memset(&fTxBf, 0, sizeof(fTxBf));
+    fTxBfValid = false;
     fTxCqDesc = NULL;
+    fTxCqMap = NULL;
     fTxCqDMA = 0;
     fRxCqDesc = NULL;
+    fRxCqMap = NULL;
     fRxCqDMA = 0;
+    fTxBufDesc = NULL;
+    fTxBufMap = NULL;
+    fTxBufDMA = 0;
     fRxBufDesc = NULL;
     fRxBufMap = NULL;
     fRxBufDMA = 0;
@@ -157,6 +175,14 @@ bool MlxEthernet::init(OSDictionary *properties)
     fTxCc = 0;
     fRxPc = 0;
     fRxCc = 0;
+    fTxCqCc = 0;
+    fRxCqCc = 0;
+    fTxArmSn = 0;
+    fRxArmSn = 0;
+    fFlowRootActive = false;
+    fFlowEntryValid = false;
+    fEnabling = false;
+    fDisabling = false;
     fNotifierRegistered = false;
     return true;
 }
@@ -174,53 +200,58 @@ bool MlxEthernet::start(IOService *provider)
     }
     fCore->retain();
 
-    /* Allocate the TX/RX ring buffers */
+    /* Allocate the TX/RX ring buffers. Both WQs must remain DMA mapped for
+     * the entire firmware-object lifetime. */
     fTxRing = OSTypeAlloc(MlxEthRing);
     if (!fTxRing || !fTxRing->init(256, 64)) {
         IOLog("MlxEthernet: TX ring allocation failed\n");
-        return false;
+        goto fail;
     }
     fRxRing = OSTypeAlloc(MlxEthRing);
     if (!fRxRing || !fRxRing->init(256, 64)) {
         IOLog("MlxEthernet: RX ring allocation failed\n");
-        return false;
+        goto fail;
     }
 
-    /* Allocate a DMA-coherent WQ buffer (TX data path) */
+    /* Allocate DMA-coherent WQ buffers for both data paths. */
     if (fTxRing->allocBuffers() != kIOReturnSuccess) {
         IOLog("MlxEthernet: TX buffer allocation failed\n");
-        return false;
+        goto fail;
+    }
+    if (fRxRing->allocBuffers() != kIOReturnSuccess) {
+        IOLog("MlxEthernet: RX buffer allocation failed\n");
+        goto fail;
     }
 
-    /* Read the MAC address (see mlx5_query_nic_vport_mac_address) */
-    uint8_t mac[6] = {0x00, 0x02, 0xC9, 0x00, 0x00, 0x01};
-    memcpy(fMacAddr, mac, 6);
-
-    /* Subscribe to EQ completion events (See mlx5e_completion_event, txrx.h)
-     * The EQ dispatches completion EQEs to this notifier (by cqn). */
-    MlxEQ *eq = fCore->getEQ();
-    if (eq) {
-        eq->registerNotifier(MLX_EVENT_TYPE_COMPLETION, this);
-        fNotifierRegistered = true;
+    /* Read the permanent MAC instead of publishing a synthetic address. */
+    if (queryMacAddress(fMacAddr) != kIOReturnSuccess) {
+        IOLog("MlxEthernet: permanent MAC query failed\n");
+        goto fail;
     }
 
     /* Create and attach the Ethernet interface to the kernel protocol stack */
     if (!attachInterface(&fNic, true)) {
         IOLog("MlxEthernet: interface creation failed\n");
-        return false;
+        goto fail;
     }
     fNetif = OSDynamicCast(IOEthernetInterface, fNic);
 
     IOLog("MlxEthernet: interface ready MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
-          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+          fMacAddr[0], fMacAddr[1], fMacAddr[2], fMacAddr[3],
+          fMacAddr[4], fMacAddr[5]);
     return true;
+
+fail:
+    releaseResources();
+    return false;
 }
 
 void MlxEthernet::stop(IOService *provider)
 {
     /* Stop the data path first (destroy the mlx5e queues) */
-    if (fEnabled)
-        disable(fNic);
+    IOReturn kr = disable(fNic);
+    if (kr != kIOReturnSuccess)
+        IOLog("MlxEthernet: teardown failed; retaining DMA resources\n");
     releaseResources();
     super::stop(provider);
 }
@@ -229,6 +260,8 @@ void MlxEthernet::releaseResources()
 {
     if (fCore && fCore->getEQ() && fNotifierRegistered) {
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
+        fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE,
+                                           this);
         fNotifierRegistered = false;
     }
     if (fNic) {
@@ -236,6 +269,14 @@ void MlxEthernet::releaseResources()
         fNic->release();
         fNic = NULL;
         fNetif = NULL;
+    }
+    if (fSqn != MLX5E_INVALID_RESOURCE ||
+        fRqn != MLX5E_INVALID_RESOURCE ||
+        fTxCqn != MLX5E_INVALID_RESOURCE ||
+        fRxCqn != MLX5E_INVALID_RESOURCE ||
+        fTirn != MLX5E_INVALID_RESOURCE || fFlowRootActive) {
+        IOLog("MlxEthernet: hardware resources quarantined\n");
+        return;
     }
     if (fTxRing) {
         fTxRing->release();
@@ -254,6 +295,12 @@ void MlxEthernet::releaseResources()
 void MlxEthernet::free()
 {
     releaseResources();
+    if (fCore || fTxRing || fRxRing) {
+        /* A failed firmware teardown intentionally retains the controller and
+         * all DMA mappings. The core HCA teardown owns the final release. */
+        IOLog("MlxEthernet: retaining quarantined controller resources\n");
+        return;
+    }
     if (fLock) {
         IOLockFree(fLock);
         fLock = NULL;
@@ -272,35 +319,94 @@ IOReturn MlxEthernet::getHardwareAddress(IOEthernetAddress *addrP)
 IOReturn MlxEthernet::enable(IONetworkInterface *netif)
 {
     (void)netif;
-    IOReturn kr;
+    IOReturn kr = kIOReturnSuccess;
+    kern_return_t flowKr = kIOReturnSuccess;
+    kern_return_t rxKr = kIOReturnSuccess;
+    kern_return_t txKr = kIOReturnSuccess;
+
+    IOLockLock(fLock);
+    if (fEnabled) {
+        IOLockUnlock(fLock);
+        return kIOReturnSuccess;
+    }
+    if (fEnabling || fDisabling) {
+        IOLockUnlock(fLock);
+        return kIOReturnBusy;
+    }
+    if (fPd != MLX5E_INVALID_RESOURCE ||
+        fTd != MLX5E_INVALID_RESOURCE ||
+        fTisn != MLX5E_INVALID_RESOURCE ||
+        fSqn != MLX5E_INVALID_RESOURCE ||
+        fRqn != MLX5E_INVALID_RESOURCE ||
+        fTirn != MLX5E_INVALID_RESOURCE ||
+        fFlowTableId != MLX5E_INVALID_RESOURCE) {
+        IOLockUnlock(fLock);
+        return kIOReturnNotReady;
+    }
+    fEnabling = true;
+    IOLockUnlock(fLock);
 
     /* Create the mlx5e TX/RX resources (See mlx5e_open_locked, en_main.c) */
-    kr = allocPdTd();
+    kr = allocGlobalResources();
     if (kr != kIOReturnSuccess) {
-        IOLog("MlxEthernet: PD/TD allocation failed\n");
-        return kr;
+        IOLog("MlxEthernet: global resource allocation failed\n");
+        goto fail;
     }
     kr = createTxResources();
     if (kr != kIOReturnSuccess) {
         IOLog("MlxEthernet: TX resource creation failed\n");
-        goto fail;
+        goto fail_all;
     }
     kr = createRxResources();
     if (kr != kIOReturnSuccess) {
         IOLog("MlxEthernet: RX resource creation failed\n");
-        goto fail_tx;
+        goto fail_all;
     }
 
-    /* Enable the data path (See mlx5e_activate_priv_channels) */
+    /* Register before arming the CQs. unregisterNotifier() synchronizes with
+     * any callback already executing during teardown. */
+    if (!fCore->getEQ()) {
+        kr = kIOReturnNotReady;
+        goto fail_all;
+    }
+    fCore->getEQ()->registerNotifier(MLX_EVENT_TYPE_COMPLETION, this);
+    fCore->getEQ()->registerNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE, this);
+    fNotifierRegistered = true;
+    armCq(fTxCqn, fTxCqDbOffset, fTxArmSn, fTxCqCc);
+    armCq(fRxCqn, fRxCqDbOffset, fRxArmSn, fRxCqCc);
+
+    kr = createRxFlowSteering();
+    if (kr != kIOReturnSuccess) {
+        IOLog("MlxEthernet: RX flow steering creation failed\n");
+        goto fail_all;
+    }
+
+    IOLockLock(fLock);
     fEnabled = true;
-    setLinkState(true, 10000);
+    fEnabling = false;
+    IOLockUnlock(fLock);
+    setLinkState(queryLinkState(), 0);
     return kIOReturnSuccess;
 
-fail_tx:
-    destroyTxResources();
+fail_all:
+    if (fNotifierRegistered && fCore->getEQ()) {
+        fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
+        fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE,
+                                           this);
+        fNotifierRegistered = false;
+    }
+    flowKr = destroyRxFlowSteering();
+    rxKr = flowKr == kIOReturnSuccess ?
+        destroyRxResources() : flowKr;
+    txKr = destroyTxResources();
+    if (flowKr == kIOReturnSuccess && rxKr == kIOReturnSuccess &&
+        txKr == kIOReturnSuccess)
+        deallocGlobalResources();
 fail:
-    deallocPdTd();
+    IOLockLock(fLock);
     fEnabled = false;
+    fEnabling = false;
+    IOLockUnlock(fLock);
     setLinkState(false, 0);
     return kr;
 }
@@ -308,29 +414,55 @@ fail:
 IOReturn MlxEthernet::disable(IONetworkInterface *netif)
 {
     (void)netif;
+    IOLockLock(fLock);
+    if (fEnabling || fDisabling) {
+        IOLockUnlock(fLock);
+        return kIOReturnBusy;
+    }
+    fDisabling = true;
     fEnabled = false;
+    IOLockUnlock(fLock);
     setLinkState(false, 0);
-    destroyRxResources();
-    destroyTxResources();
-    deallocPdTd();
-    return kIOReturnSuccess;
+    if (fNotifierRegistered && fCore && fCore->getEQ()) {
+        fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
+        fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE,
+                                           this);
+        fNotifierRegistered = false;
+    }
+    kern_return_t flowKr = destroyRxFlowSteering();
+    kern_return_t rxKr = flowKr == kIOReturnSuccess ?
+        destroyRxResources() : flowKr;
+    kern_return_t txKr = destroyTxResources();
+    kern_return_t result = flowKr;
+    if (result == kIOReturnSuccess)
+        result = rxKr;
+    if (result == kIOReturnSuccess)
+        result = txKr;
+    if (result == kIOReturnSuccess)
+        result = deallocGlobalResources();
+    IOLockLock(fLock);
+    fDisabling = false;
+    IOLockUnlock(fLock);
+    return result;
 }
 
 IOReturn MlxEthernet::setPromiscuousMode(bool active)
 {
-    return kIOReturnSuccess;
+    (void)active;
+    return kIOReturnUnsupported;
 }
 
 IOReturn MlxEthernet::setMulticastMode(bool active)
 {
-    return kIOReturnSuccess;
+    (void)active;
+    return kIOReturnUnsupported;
 }
 
 IOReturn MlxEthernet::getPacketFilters(const OSSymbol *group, UInt32 *filters) const
 {
     if (group == gIONetworkFilterGroup) {
         *filters = kIOPacketFilterUnicast | kIOPacketFilterMulticast |
-                   kIOPacketFilterBroadcast | kIOPacketFilterPromiscuous;
+                   kIOPacketFilterBroadcast;
         return kIOReturnSuccess;
     }
     return kIOReturnUnsupported;
@@ -357,7 +489,8 @@ IOReturn MlxEthernet::setProperties(OSObject *properties)
 UInt32 MlxEthernet::outputPacket(mbuf_t packet, void *param)
 {
     (void)param;
-    if (!fEnabled || !packet || !fTxRing || !fSqn)
+    if (!fEnabled || !packet || !fTxRing ||
+        fSqn == MLX5E_INVALID_RESOURCE)
         return kIOReturnOutputStall;
 
     if (xmitPacket(packet) != kIOReturnSuccess)
@@ -370,7 +503,9 @@ kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
     /* See mlx5e_xmit (en_tx.c:666) + mlx5e_sq_xmit_wqe:
      * WQE = ctrl(16B) + eth(16B) + data seg (DMA)
      * Write to the SQ ring buffer → update the DB record → ring the doorbell */
-    if (!packet || !fTxRing || !fTxRing->getWqBuf() || !fSqn)
+    if (!packet || !fTxRing || !fTxRing->getWqBuf() ||
+        fSqn == MLX5E_INVALID_RESOURCE || !fTxBufDesc || !fTxBufDMA ||
+        !fLkey || !fTxBfValid)
         return kIOReturnInvalid;
 
     uint32_t len = mbuf_pkthdr_len(packet);
@@ -378,12 +513,16 @@ kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
         mbuf_freem(packet);
         return kIOReturnSuccess;
     }
-    if (len > 0xFFFF) {
+    if (len > MLX5E_TX_BUF_SIZE) {
         mbuf_freem(packet);
-        return kIOReturnInvalid;
+        return kIOReturnSuccess;
     }
 
     IOLockLock(fLock);
+    if (!fEnabled || fSqn == MLX5E_INVALID_RESOURCE || !fTxBfValid) {
+        IOLockUnlock(fLock);
+        return kIOReturnNotReady;
+    }
     /* Check ring room (See mlx5e_wqc_has_room_for, txrx.h) */
     if ((uint16_t)(fTxPc - fTxCc) >= fTxRing->getSize()) {
         IOLockUnlock(fLock);
@@ -395,35 +534,48 @@ kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
 
     /* WQE: ctrl + eth + data seg (see mlx5e_tx_wqe, en.h:244) */
     MlxEthTxWqe *wqe = (MlxEthTxWqe *)fTxRing->getWqebb(pi);
-    memset(wqe, 0, 48);   /* ctrl16 + eth16 + data16 */
+    memset(wqe, 0, 64);
 
     /* ctrl segment (see mlx5e_txwqe_complete, en_tx.c)
      *   opmod_idx_opcode = (pc << 8) | opcode
      *   qpn_ds           = (sqn << 8) | ds_cnt   (ds in 16-byte units) */
     wqe->ctrl.opmod_idx_opcode = OSSwapHostToBigInt32(
         ((uint32_t)fTxPc << 8) | MLX_OPCODE_SEND);
-    wqe->ctrl.qpn_ds = OSSwapHostToBigInt32(
-        (fSqn << 8) | 3u);          /* 3 DS: ctrl+eth+data */
-
-    /* eth segment (see mlx5e_txwqe_build_eseg_csum, en_tx.c)
-     * MVP: no checksum offload (cs_flags=0), hardware inserts the header */
-    wqe->eth.cs_flags = 0;
-
-    /* data segment: mbuf data → DMA address (see mlx5e_txwqe_build_dsegs) */
-    uint8_t *data = (uint8_t *)mbuf_data(packet);
-    uint64_t phys = 0;
-    if (fCore && fCore->getDMA()) {
-        MlxDMAReq req = {};
-        if (fCore->getDMA()->pinUserMemory((uint64_t)(uintptr_t)data,
-                                           len, &req) == kIOReturnSuccess) {
-            phys = req.paList[0];
-            fCore->getDMA()->unpinMemory(&req);
-        }
+    /* Copy the complete mbuf chain into a persistent DMA bounce slot. */
+    uint8_t *data = static_cast<uint8_t *>(fTxBufDesc->getBytesNoCopy()) +
+                    ((uint32_t)pi * MLX5E_TX_BUF_SIZE);
+    if (mbuf_copydata(packet, 0, len, data) != 0) {
+        IOLockUnlock(fLock);
+        mbuf_freem(packet);
+        return kIOReturnSuccess;
     }
-    wqe->data[0].byte_count = OSSwapHostToBigInt32(len);
-    wqe->data[0].lkey = OSSwapHostToBigInt32(0x1);
-    wqe->data[0].addr = OSSwapHostToBigInt64(phys ? phys
-                                                  : (uint64_t)(uintptr_t)data);
+
+    /* The vport may require the L2 header inline. The first two inline bytes
+     * live in the Ethernet segment and the remaining bytes occupy one DS. */
+    uint32_t inlineLen = fTxMinInlineMode == 1 ? 14 : 0;
+    if (inlineLen && len < inlineLen) {
+        IOLockUnlock(fLock);
+        mbuf_freem(packet);
+        return kIOReturnSuccess;
+    }
+    MlxWqeDataSeg *dseg;
+    uint32_t dsCount;
+    if (inlineLen) {
+        wqe->eth.inline_hdr.sz = OSSwapHostToBigInt16(inlineLen);
+        memcpy(wqe->eth.inline_hdr.start, data, inlineLen);
+        dseg = reinterpret_cast<MlxWqeDataSeg *>(
+            static_cast<uint8_t *>(fTxRing->getWqebb(pi)) + 48);
+        dsCount = 4;
+    } else {
+        dseg = &wqe->data[0];
+        dsCount = 3;
+    }
+    wqe->ctrl.qpn_ds = OSSwapHostToBigInt32((fSqn << 8) | dsCount);
+    wqe->eth.cs_flags = 0;
+    dseg->byte_count = OSSwapHostToBigInt32(len - inlineLen);
+    dseg->lkey = OSSwapHostToBigInt32(fLkey);
+    dseg->addr = OSSwapHostToBigInt64(
+        fTxBufDMA + (uint64_t)pi * MLX5E_TX_BUF_SIZE + inlineLen);
 
     /* Keep the mbuf alive until the TX CQE arrives (See mlx5e_tx_wqe_info.skb) */
     fTxRing->setHead(fTxPc);
@@ -438,12 +590,11 @@ kern_return_t MlxEthernet::xmitPacket(mbuf_t packet)
     mlxMemoryBarrier();
     if (fTxRing->getDbRecord())
         *fTxRing->getDbRecord() = OSSwapHostToBigInt32(fTxPc);
-    if (fTxBf) {
-        /* mlx5_write64(ctrl, uar_map): write the first 8 bytes of the ctrl
-         * segment as the blue-flame doorbell */
-        volatile uint64_t *bf = (volatile uint64_t *)fTxBf;
-        *bf = *(volatile uint64_t *)&w->ctrl;
-    }
+    /* mlx5_write64(ctrl, uar_map): write the first 8 bytes of the control
+     * segment as one ordered PCI MMIO doorbell. */
+    volatile uint64_t *bf = static_cast<volatile uint64_t *>(fTxBf.map);
+    *bf = *reinterpret_cast<volatile uint64_t *>(&w->ctrl);
+    OSSynchronizeIO();
     IOLockUnlock(fLock);
     return kIOReturnSuccess;
 }
@@ -467,24 +618,35 @@ void MlxEthernet::handleRxCqe(struct MlxCqe64 *cqe)
      *   byte_cnt = packet length (BE), cqe->sop_drop_qpn bit31 = start of packet */
     if (!cqe || !fRxBufDesc || !fRxBufDMA)
         return;
+    uint16_t wqe_counter = OSSwapBigToHostInt16(cqe->wqe_counter);
+    uint16_t wqe_idx = wqe_counter &
+        ((1u << MLX5E_DEFAULT_LOG_RQ_SIZE) - 1);
     uint32_t bcnt = OSSwapBigToHostInt32(cqe->byte_cnt);
-    if (bcnt == 0 || bcnt > MLX5E_RX_BUF_SIZE)
-        return;
+    uint8_t opcode = MLX_CQE_GET_OPCODE(cqe);
 
     /* The packet data was DMA'd into the RX buffer pool slot. Allocate an
      * mbuf, copy the payload, and hand it to the kernel protocol stack. */
-    uint16_t wqe_idx = fRxCc & ((1u << MLX5E_DEFAULT_LOG_RQ_SIZE) - 1);
-    uint8_t *src = (uint8_t *)fRxBufDesc->getBytesNoCopy() +
-                   ((uint32_t)wqe_idx * MLX5E_RX_BUF_SIZE);
-
     mbuf_t m = NULL;
-    if (mbuf_allocpacket(MBUF_DONTWAIT, bcnt, NULL, &m) == 0 && m) {
+    uint8_t *src = NULL;
+    if (opcode == MLX_CQE_RESP && bcnt > 0 && bcnt <= MLX5E_RX_BUF_SIZE) {
+        src = static_cast<uint8_t *>(fRxBufDesc->getBytesNoCopy()) +
+              ((uint32_t)wqe_idx * MLX5E_RX_BUF_SIZE);
+        mbuf_allocpacket(MBUF_DONTWAIT, bcnt, NULL, &m);
+    }
+    if (m) {
         memcpy(mbuf_data(m), src, bcnt);
         mbuf_setlen(m, bcnt);
         mbuf_pkthdr_setlen(m, bcnt);
     }
-    /* Repost the RX WQE slot */
-    postRxWqe(wqe_idx);
+    /* Every consumed CQE returns one cyclic RQ slot, including errors. */
+    uint16_t post_idx = fRxPc &
+        ((1u << MLX5E_DEFAULT_LOG_RQ_SIZE) - 1);
+    if (postRxWqe(post_idx) == kIOReturnSuccess) {
+        fRxPc++;
+        mlxMemoryBarrier();
+        *fRxRing->getDbRecord() = OSSwapHostToBigInt32(fRxPc);
+    }
+    fRxCc = static_cast<uint16_t>(wqe_counter + 1);
     if (m)
         receivePacket(m, bcnt);
 }
@@ -553,11 +715,47 @@ kern_return_t MlxEthernet::cmdAllocPd(uint32_t *pd)
     return kr;
 }
 
+kern_return_t MlxEthernet::cmdCreateMkey(uint32_t pd, uint32_t *mkeyIndex,
+                                         uint32_t *lkey)
+{
+    /* mlx5e uses a PA-mode local read/write MKey for kernel DMA addresses. */
+    uint8_t in[0x110] = {};
+    uint8_t out[16] = {};
+    const uint8_t variant = 0x42;
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_MKEY);
+    uint8_t *mkc = in + 0x10;                /* MKC starts at bit 0x80 */
+    mlxSetBits(mkc, 0x14, 1, 1);             /* local write */
+    mlxSetBits(mkc, 0x15, 1, 1);             /* local read */
+    mlxSetBits(mkc, 0x16, 2, 0);             /* PA access mode */
+    mlxSetBits(mkc, 0x20, 24, 0xffffff);      /* unrestricted QPN */
+    mlxSetBits(mkc, 0x38, 8, variant);
+    mlxSetBits(mkc, 0x60, 1, 1);             /* length64 */
+    mlxSetBits(mkc, 0x68, 24, pd);
+    kern_return_t kr = fCore->exec(MLX_CMD_OP_CREATE_MKEY, in, sizeof(in),
+                                   out, sizeof(out), 5000);
+    if (kr == kIOReturnSuccess) {
+        uint32_t index = mlx5e_out_obj(out);
+        if (mkeyIndex) *mkeyIndex = index;
+        if (lkey) *lkey = (index << 8) | variant;
+    }
+    return kr;
+}
+
+kern_return_t MlxEthernet::cmdDestroyObject(uint32_t opcode,
+                                             uint32_t objectId)
+{
+    uint8_t in[16] = {};
+    uint8_t out[16] = {};
+    OSWriteBigInt16(in, 0, static_cast<uint16_t>(opcode));
+    mlxSetBits(in, 0x48, 24, objectId);
+    return fCore->exec(opcode, in, sizeof(in), out, sizeof(out), 5000);
+}
+
 kern_return_t MlxEthernet::cmdCreateTis(uint32_t td, uint32_t pd, uint32_t *tisn)
 {
     /* CREATE_TIS (0x912). tisc at bit 0x100:
      *   transport_domain at +0x128 (24b), pd at +0x168 (24b) */
-    uint8_t in[0x80] = {};
+    uint8_t in[0xc0] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_TIS);
     mlxSetBits(in, 0x100 + 0x128, 24, td);
@@ -570,10 +768,10 @@ kern_return_t MlxEthernet::cmdCreateTis(uint32_t td, uint32_t pd, uint32_t *tisn
 }
 
 kern_return_t MlxEthernet::cmdCreateCq(uint32_t logSize, uint32_t *cqn,
-                                       void **cqBuf,
-                                       IOBufferMemoryDescriptor **cqDesc,
-                                       uint64_t *cqDMA,
-                                       uint32_t *dbOffset)
+                                        void **cqBuf,
+                                        IOBufferMemoryDescriptor **cqDesc,
+                                        IODMACommand **cqMap, uint64_t *cqDMA,
+                                        uint32_t *dbOffset)
 {
     /* CREATE_CQ (0x400). cqc at bit 0x80 (byte 0x10):
      *   cqe_sz at +0x8 (3b, 0=64B), log_cq_size at +0x63 (5b),
@@ -586,6 +784,9 @@ kern_return_t MlxEthernet::cmdCreateCq(uint32_t logSize, uint32_t *cqn,
     if (!desc)
         return kIOReturnNoMemory;
     memset(desc->getBytesNoCopy(), 0, cqeBytes);
+    MlxCqe64 *cqes = reinterpret_cast<MlxCqe64 *>(desc->getBytesNoCopy());
+    for (uint32_t i = 0; i < (1u << logSize); i++)
+        cqes[i].op_own = 0xf1;
 
     IODMACommand *map = NULL;
     uint64_t dma = 0;
@@ -612,10 +813,11 @@ kern_return_t MlxEthernet::cmdCreateCq(uint32_t logSize, uint32_t *cqn,
     mlxSetBits(cqc, 0xb8, 8, fCore->getEQ()->getCompEqNumber(0));
     mlxSetBits(cqc, 0xc3, 5, 0);           /* 4K pages */
     mlxSetBits(cqc, 0x1c0, 64, fCore->getUAR()->getDbRecordDMA() + dbOff);
-    mlxSetBits(in, 0x2e0, 1, 1);           /* cq_umem_valid */
-    OSWriteBigInt64(in, 0x880 / 8, dma);
+    for (uint32_t i = 0; i < (cqeBytes + 4095) / 4096; i++)
+        OSWriteBigInt64(in, 0x880 / 8 + i * 8, dma + (uint64_t)i * 4096);
 
-    uint32_t inSize = 0x880 / 8 + 8;
+    uint32_t numPages = (cqeBytes + 4095) / 4096;
+    uint32_t inSize = 0x880 / 8 + numPages * 8;
     kern_return_t kr = fCore->exec(MLX_CMD_OP_CREATE_CQ, in, inSize,
                                    out, sizeof(out), 5000);
     if (kr != kIOReturnSuccess) {
@@ -629,20 +831,15 @@ kern_return_t MlxEthernet::cmdCreateCq(uint32_t logSize, uint32_t *cqn,
     if (cqBuf)   *cqBuf = desc->getBytesNoCopy();
     if (cqDesc)  *cqDesc = desc;      /* transfer ownership to the caller */
     else         desc->release();
+    if (cqMap)   *cqMap = map;
     if (cqDMA)   *cqDMA = dma;
     if (dbOffset) *dbOffset = dbOff;
-    mlxUnmapDMA(map);
     return kIOReturnSuccess;
 }
 
 kern_return_t MlxEthernet::cmdDestroyCq(uint32_t cqn)
 {
-    uint8_t in[16] = {};
-    uint8_t out[16] = {};
-    OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_CQ);
-    OSWriteBigInt32(in, 4, cqn);
-    return fCore->exec(MLX_CMD_OP_DESTROY_CQ, in, sizeof(in),
-                       out, sizeof(out), 5000);
+    return cmdDestroyObject(MLX_CMD_OP_DESTROY_CQ, cqn);
 }
 
 kern_return_t MlxEthernet::cmdCreateSq(uint32_t tisn, uint32_t cqn, uint32_t *sqn,
@@ -671,6 +868,7 @@ kern_return_t MlxEthernet::cmdCreateSq(uint32_t tisn, uint32_t cqn, uint32_t *sq
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_SQ);
     uint8_t *sqc = in + 0x20;              /* sqc at byte 0x20 */
     mlxSetBits(sqc, 0x08, 4, 0);           /* state RST */
+    mlxSetBits(sqc, 0x05, 3, fTxMinInlineMode);
     mlxSetBits(sqc, 0x48, 24, cqn);
     mlxSetBits(sqc, 0x100, 16, 1);         /* tis_lst_sz = 1 */
     mlxSetBits(sqc, 0x168, 24, tisn);
@@ -682,12 +880,12 @@ kern_return_t MlxEthernet::cmdCreateSq(uint32_t tisn, uint32_t cqn, uint32_t *sq
     mlxSetBits(wq, 0x10c, 4, 6);           /* log_wq_stride = 64B */
     mlxSetBits(wq, 0x113, 5, 0);           /* 4K pages */
     mlxSetBits(wq, 0x11b, 5, logSize);
-    mlxSetBits(wq, 0x120, 1, 1);           /* dbr_umem_valid */
-    mlxSetBits(wq, 0x121, 1, 1);           /* wq_umem_valid */
     /* PAS at wq bit 0x600 = input byte 0x50 + 0xc0 = 0x110 */
-    OSWriteBigInt64(in, 0x110, fTxRing->getWqDMA());
+    for (uint32_t i = 0; i < 4; i++)
+        OSWriteBigInt64(in, 0x110 + i * 8,
+                        fTxRing->getWqDMA() + (uint64_t)i * 4096);
 
-    uint32_t inSize = 0x110 + 8;
+    uint32_t inSize = 0x110 + 4 * 8;
     kern_return_t kr = fCore->exec(MLX_CMD_OP_CREATE_SQ, in, inSize,
                                    out, sizeof(out), 5000);
     if (kr != kIOReturnSuccess) {
@@ -699,7 +897,8 @@ kern_return_t MlxEthernet::cmdCreateSq(uint32_t tisn, uint32_t cqn, uint32_t *sq
     if (dbOffset) *dbOffset = dbOff;
 
     /* Point the ring doorbell record at the SQ DB slot */
-    fTxRing->setDbRecord(fCore->getUAR()->getDbRecord() + dbOff / 4);
+    fTxRing->setDbRecord(fCore->getUAR()->getDbRecord() + dbOff / 4 +
+                         MLX_SND_DBR);
     fTxRing->setDbDMA(fCore->getUAR()->getDbRecordDMA() + dbOff);
     return kIOReturnSuccess;
 }
@@ -708,7 +907,7 @@ kern_return_t MlxEthernet::cmdCreateRq(uint32_t cqn, uint32_t *rqn,
                                        uint32_t *dbOffset)
 {
     /* CREATE_RQ (0x908). rqc at bit 0x100:
-     *   mem_rq_type at +0x4 (4b, INLINE=0), state at +0x8 (4b, RDY=1),
+     *   mem_rq_type at +0x4 (4b, INLINE=0), state at +0x8 (4b, RST=0),
      *   cqn at +0x48 (24b), counter_set_id at +0x60 (8b)
      * wq at +0x180 (same layout as SQ)
      * The WQ buffer is the RX ring buffer (already DMA-coherent). */
@@ -725,7 +924,7 @@ kern_return_t MlxEthernet::cmdCreateRq(uint32_t cqn, uint32_t *rqn,
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_RQ);
     uint8_t *rqc = in + 0x20;              /* rqc at byte 0x20 */
     mlxSetBits(rqc, 0x04, 4, 0);           /* mem_rq_type INLINE */
-    mlxSetBits(rqc, 0x08, 4, 1);           /* state RDY */
+    mlxSetBits(rqc, 0x08, 4, 0);           /* state RST */
     mlxSetBits(rqc, 0x48, 24, cqn);
     uint8_t *wq = rqc + 0x30;              /* wq at byte 0x50 */
     mlxSetBits(wq, 0x00, 4, 1);            /* wq_type CYCLIC */
@@ -735,11 +934,11 @@ kern_return_t MlxEthernet::cmdCreateRq(uint32_t cqn, uint32_t *rqn,
     mlxSetBits(wq, 0x10c, 4, 6);           /* log_wq_stride = 64B */
     mlxSetBits(wq, 0x113, 5, 0);           /* 4K pages */
     mlxSetBits(wq, 0x11b, 5, logSize);
-    mlxSetBits(wq, 0x120, 1, 1);           /* dbr_umem_valid */
-    mlxSetBits(wq, 0x121, 1, 1);           /* wq_umem_valid */
-    OSWriteBigInt64(in, 0x110, fRxRing->getWqDMA());
+    for (uint32_t i = 0; i < 4; i++)
+        OSWriteBigInt64(in, 0x110 + i * 8,
+                        fRxRing->getWqDMA() + (uint64_t)i * 4096);
 
-    uint32_t inSize = 0x110 + 8;
+    uint32_t inSize = 0x110 + 4 * 8;
     kern_return_t kr = fCore->exec(MLX_CMD_OP_CREATE_RQ, in, inSize,
                                    out, sizeof(out), 5000);
     if (kr != kIOReturnSuccess) {
@@ -760,7 +959,7 @@ kern_return_t MlxEthernet::cmdCreateTir(uint32_t rqn, uint32_t td, uint32_t *tir
     /* CREATE_TIR (0x900). tirc at bit 0x100:
      *   disp_type at +0x20 (4b, DIRECT=0), inline_rqn at +0xe8 (24b),
      *   transport_domain at +0x128 (24b) */
-    uint8_t in[0x80] = {};
+    uint8_t in[0x100] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_CREATE_TIR);
     mlxSetBits(in, 0x100 + 0x20, 4, 0);      /* DIRECT RQ */
@@ -773,161 +972,406 @@ kern_return_t MlxEthernet::cmdCreateTir(uint32_t rqn, uint32_t td, uint32_t *tir
     return kr;
 }
 
-kern_return_t MlxEthernet::allocPdTd()
+kern_return_t MlxEthernet::cmdModifySqReady(uint32_t sqn)
+{
+    uint8_t in[0x110] = {};
+    uint8_t out[16] = {};
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_MODIFY_SQ);
+    mlxSetBits(in, 0x40, 4, 0);             /* current state RST */
+    mlxSetBits(in, 0x48, 24, sqn);
+    mlxSetBits(in, 0x108, 4, 1);            /* new state RDY */
+    return fCore->exec(MLX_CMD_OP_MODIFY_SQ, in, sizeof(in),
+                       out, sizeof(out), 5000);
+}
+
+kern_return_t MlxEthernet::cmdModifyRqReady(uint32_t rqn)
+{
+    uint8_t in[0x110] = {};
+    uint8_t out[16] = {};
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_MODIFY_RQ);
+    mlxSetBits(in, 0x40, 4, 0);             /* current state RST */
+    mlxSetBits(in, 0x48, 24, rqn);
+    mlxSetBits(in, 0x108, 4, 1);            /* new state RDY */
+    return fCore->exec(MLX_CMD_OP_MODIFY_RQ, in, sizeof(in),
+                       out, sizeof(out), 5000);
+}
+
+kern_return_t MlxEthernet::queryMacAddress(uint8_t mac[6])
+{
+    if (!mac)
+        return kIOReturnBadArgument;
+    uint8_t in[16] = {};
+    uint8_t out[0x110] = {};
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_QUERY_NIC_VPORT_CONTEXT);
+    kern_return_t kr = fCore->exec(MLX_CMD_OP_QUERY_NIC_VPORT_CONTEXT,
+                                   in, sizeof(in), out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess)
+        return kr;
+    fTxMinInlineMode = static_cast<uint8_t>(mlxGetBits(out, 0x85, 3));
+    if (fTxMinInlineMode > 1) {
+        IOLog("MlxEthernet: unsupported minimum inline mode %u\n",
+              fTxMinInlineMode);
+        return kIOReturnUnsupported;
+    }
+    memcpy(mac, out + 0x106, 6);
+    bool allZero = true;
+    for (uint32_t i = 0; i < 6; i++)
+        allZero &= mac[i] == 0;
+    return allZero ? kIOReturnNotFound : kIOReturnSuccess;
+}
+
+bool MlxEthernet::queryLinkState()
+{
+    uint8_t in[16] = {};
+    uint8_t out[16] = {};
+    OSWriteBigInt16(in, 0, MLX_CMD_OP_QUERY_VPORT_STATE);
+    mlxSetBits(in, 0x30, 16, 0);             /* VNIC vport */
+    if (fCore->exec(MLX_CMD_OP_QUERY_VPORT_STATE, in, sizeof(in),
+                    out, sizeof(out), 5000) != kIOReturnSuccess)
+        return false;
+    return mlxGetBits(out, 0x7c, 4) == 1;
+}
+
+kern_return_t MlxEthernet::createRxFlowSteering()
+{
+    uint8_t out[16] = {};
+    uint8_t tableIn[0x38] = {};
+    uint8_t groupIn[0x400] = {};
+    uint8_t fteIn[0x348] = {};
+    uint8_t rootIn[0x40] = {};
+    kern_return_t kr;
+
+    /* One-entry NIC_RX catch-all table. The root is connected last. */
+    OSWriteBigInt16(tableIn, 0, MLX_CMD_OP_CREATE_FLOW_TABLE);
+    mlxSetBits(tableIn, 0x80, 8, 0);         /* NIC_RX */
+    mlxSetBits(tableIn, 0xc8, 8, 0);         /* level 0 */
+    mlxSetBits(tableIn, 0xd8, 8, 0);         /* one entry */
+    kr = fCore->exec(MLX_CMD_OP_CREATE_FLOW_TABLE, tableIn,
+                     sizeof(tableIn), out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess)
+        return kr;
+    fFlowTableId = mlx5e_out_obj(out);
+
+    memset(out, 0, sizeof(out));
+    OSWriteBigInt16(groupIn, 0, MLX_CMD_OP_CREATE_FLOW_GROUP);
+    mlxSetBits(groupIn, 0x80, 8, 0);
+    mlxSetBits(groupIn, 0xa8, 24, fFlowTableId);
+    mlxSetBits(groupIn, 0xe0, 32, 0);
+    mlxSetBits(groupIn, 0x120, 32, 0);
+    mlxSetBits(groupIn, 0x1f8, 8, 0);        /* catch-all */
+    kr = fCore->exec(MLX_CMD_OP_CREATE_FLOW_GROUP, groupIn,
+                     sizeof(groupIn), out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    fFlowGroupId = mlx5e_out_obj(out);
+
+    memset(out, 0, sizeof(out));
+    OSWriteBigInt16(fteIn, 0, MLX_CMD_OP_SET_FLOW_TABLE_ENTRY);
+    mlxSetBits(fteIn, 0x80, 8, 0);
+    mlxSetBits(fteIn, 0xa8, 24, fFlowTableId);
+    mlxSetBits(fteIn, 0x100, 32, 0);         /* flow index */
+    mlxSetBits(fteIn, 0x220, 32, fFlowGroupId);
+    mlxSetBits(fteIn, 0x270, 16, 0x4);       /* forward destination */
+    mlxSetBits(fteIn, 0x288, 24, 1);
+    mlxSetBits(fteIn, 0x1a00, 8, 2);         /* TIR */
+    mlxSetBits(fteIn, 0x1a08, 24, fTirn);
+    kr = fCore->exec(MLX_CMD_OP_SET_FLOW_TABLE_ENTRY, fteIn,
+                     sizeof(fteIn), out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    fFlowEntryValid = true;
+
+    memset(out, 0, sizeof(out));
+    OSWriteBigInt16(rootIn, 0, MLX_CMD_OP_SET_FLOW_TABLE_ROOT);
+    mlxSetBits(rootIn, 0x80, 8, 0);
+    mlxSetBits(rootIn, 0xa8, 24, fFlowTableId);
+    kr = fCore->exec(MLX_CMD_OP_SET_FLOW_TABLE_ROOT, rootIn,
+                     sizeof(rootIn), out, sizeof(out), 5000);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    fFlowRootActive = true;
+    return kIOReturnSuccess;
+
+fail:
+    destroyRxFlowSteering();
+    return kr;
+}
+
+kern_return_t MlxEthernet::destroyRxFlowSteering()
+{
+    uint8_t in[0x40] = {};
+    uint8_t out[16] = {};
+    kern_return_t kr;
+    if (fFlowRootActive) {
+        OSWriteBigInt16(in, 0, MLX_CMD_OP_SET_FLOW_TABLE_ROOT);
+        mlxSetBits(in, 0x30, 16, 1);         /* disconnect root */
+        mlxSetBits(in, 0x80, 8, 0);
+        kr = fCore->exec(MLX_CMD_OP_SET_FLOW_TABLE_ROOT, in, sizeof(in),
+                         out, sizeof(out), 5000);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fFlowRootActive = false;
+    }
+    if (fFlowEntryValid) {
+        memset(in, 0, sizeof(in));
+        memset(out, 0, sizeof(out));
+        OSWriteBigInt16(in, 0, MLX_CMD_OP_DELETE_FLOW_TABLE_ENTRY);
+        mlxSetBits(in, 0x80, 8, 0);
+        mlxSetBits(in, 0xa8, 24, fFlowTableId);
+        mlxSetBits(in, 0x100, 32, 0);
+        kr = fCore->exec(MLX_CMD_OP_DELETE_FLOW_TABLE_ENTRY, in,
+                         sizeof(in), out, sizeof(out), 5000);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fFlowEntryValid = false;
+    }
+    if (fFlowGroupId != MLX5E_INVALID_RESOURCE) {
+        memset(in, 0, sizeof(in));
+        memset(out, 0, sizeof(out));
+        OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_FLOW_GROUP);
+        mlxSetBits(in, 0x80, 8, 0);
+        mlxSetBits(in, 0xa8, 24, fFlowTableId);
+        mlxSetBits(in, 0xc0, 32, fFlowGroupId);
+        kr = fCore->exec(MLX_CMD_OP_DESTROY_FLOW_GROUP, in, sizeof(in),
+                         out, sizeof(out), 5000);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fFlowGroupId = MLX5E_INVALID_RESOURCE;
+    }
+    if (fFlowTableId != MLX5E_INVALID_RESOURCE) {
+        memset(in, 0, sizeof(in));
+        memset(out, 0, sizeof(out));
+        OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_FLOW_TABLE);
+        mlxSetBits(in, 0x80, 8, 0);
+        mlxSetBits(in, 0xa8, 24, fFlowTableId);
+        kr = fCore->exec(MLX_CMD_OP_DESTROY_FLOW_TABLE, in, sizeof(in),
+                         out, sizeof(out), 5000);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fFlowTableId = MLX5E_INVALID_RESOURCE;
+    }
+    return kIOReturnSuccess;
+}
+
+kern_return_t MlxEthernet::allocGlobalResources()
 {
     kern_return_t kr = cmdAllocPd(&fPd);
     if (kr != kIOReturnSuccess)
         return kr;
-    return cmdAllocTd(&fTd);
+    kr = cmdAllocTd(&fTd);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    kr = cmdCreateMkey(fPd, &fMkeyIndex, &fLkey);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    return kIOReturnSuccess;
+
+fail:
+    deallocGlobalResources();
+    return kr;
 }
 
-void MlxEthernet::deallocPdTd()
+kern_return_t MlxEthernet::deallocGlobalResources()
 {
-    if (fTd) {
-        uint8_t in[16] = {};
-        uint8_t out[16] = {};
-        OSWriteBigInt16(in, 0, MLX_CMD_OP_DEALLOC_TRANSPORT_DOMAIN);
-        OSWriteBigInt32(in, 4, fTd);
-        fCore->exec(MLX_CMD_OP_DEALLOC_TRANSPORT_DOMAIN, in, sizeof(in),
-                    out, sizeof(out), 5000);
-        fTd = 0;
+    kern_return_t firstError = kIOReturnSuccess;
+    kern_return_t kr;
+    if (fMkeyIndex != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DESTROY_MKEY, fMkeyIndex);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fMkeyIndex = MLX5E_INVALID_RESOURCE;
+        fLkey = 0;
     }
-    if (fPd) {
-        uint8_t in[16] = {};
-        uint8_t out[16] = {};
-        OSWriteBigInt16(in, 0, MLX_CMD_OP_DEALLOC_PD);
-        OSWriteBigInt32(in, 4, fPd);
-        fCore->exec(MLX_CMD_OP_DEALLOC_PD, in, sizeof(in),
-                    out, sizeof(out), 5000);
-        fPd = 0;
+    if (fTd != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DEALLOC_TRANSPORT_DOMAIN, fTd);
+        if (kr != kIOReturnSuccess)
+            firstError = kr;
+        else
+            fTd = MLX5E_INVALID_RESOURCE;
     }
+    if (firstError == kIOReturnSuccess && fPd != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DEALLOC_PD, fPd);
+        if (kr != kIOReturnSuccess)
+            firstError = kr;
+        else
+            fPd = MLX5E_INVALID_RESOURCE;
+    }
+    return firstError;
 }
 
 kern_return_t MlxEthernet::createTxResources()
 {
-    /* TX: TIS + SQ + TX CQ (See mlx5e_create_tis / mlx5e_open_txqsq) */
-    kern_return_t kr = cmdCreateTis(fTd, fPd, &fTisn);
+    /* TX uses a persistent bounce pool so arbitrary mbuf chains are copied
+     * into one DMA segment with a lifetime matching the SQ. */
+    fTxPc = 0;
+    fTxCc = 0;
+    fTxCqCc = 0;
+    fTxArmSn = 0;
+    for (uint16_t i = 0; i < (1u << MLX5E_DEFAULT_LOG_SQ_SIZE); i++)
+        fTxRing->clearWqeMbuf(i);
+
+    uint32_t poolBytes = (1u << MLX5E_DEFAULT_LOG_SQ_SIZE) * MLX5E_TX_BUF_SIZE;
+    fTxBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
+        kernel_task, kIODirectionInOut, poolBytes, 0xFFFFFFF000ULL);
+    if (!fTxBufDesc)
+        return kIOReturnNoMemory;
+    memset(fTxBufDesc->getBytesNoCopy(), 0, poolBytes);
+    kern_return_t kr = mlxMapDMAContiguous(fTxBufDesc, &fTxBufMap, &fTxBufDMA);
     if (kr != kIOReturnSuccess)
-        return kr;
+        goto fail;
+
+    kr = cmdCreateTis(fTd, fPd, &fTisn);
+    if (kr != kIOReturnSuccess)
+        goto fail;
     kr = cmdCreateCq(MLX5E_DEFAULT_LOG_SQ_SIZE, &fTxCqn, &fTxCqBuf,
-                     &fTxCqDesc, &fTxCqDMA, &fTxCqDbOffset);
+                      &fTxCqDesc, &fTxCqMap, &fTxCqDMA, &fTxCqDbOffset);
     if (kr != kIOReturnSuccess)
-        return kr;
+        goto fail;
     kr = cmdCreateSq(fTisn, fTxCqn, &fSqn, &fTxDbOffset);
     if (kr != kIOReturnSuccess)
-        return kr;
+        goto fail;
     /* Allocate a blue-flame doorbell register (See mlx5_alloc_bfreg) */
-    MlxBfreg bf;
-    if (fCore->getUAR()->allocBfreg(&bf) == kIOReturnSuccess)
-        fTxBf = bf.map;
-    else
-        fTxBf = NULL;
+    kr = fCore->getUAR()->allocBfreg(&fTxBf);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    fTxBfValid = true;
+    kr = cmdModifySqReady(fSqn);
+    if (kr != kIOReturnSuccess)
+        goto fail;
     return kIOReturnSuccess;
+
+fail:
+    destroyTxResources();
+    return kr;
 }
 
 kern_return_t MlxEthernet::createRxResources()
 {
-    /* RX: RQ + TIR + RX CQ (See mlx5e_open_rq / mlx5e_create_tir) */
-    kern_return_t kr = cmdCreateCq(MLX5E_DEFAULT_LOG_RQ_SIZE, &fRxCqn,
-                                   &fRxCqBuf, &fRxCqDesc, &fRxCqDMA,
-                                   &fRxCqDbOffset);
-    if (kr != kIOReturnSuccess)
-        return kr;
-    kr = cmdCreateRq(fRxCqn, &fRqn, &fRxDbOffset);
-    if (kr != kIOReturnSuccess)
-        return kr;
-    kr = cmdCreateTir(fRqn, fTd, &fTirn);
-    if (kr != kIOReturnSuccess)
-        return kr;
-    /* Allocate the RX buffer pool (DMA-coherent) and post initial WQEs */
+    /* Prepare all RX DMA memory and WQEs before transitioning the RQ to RDY. */
+    fRxPc = 0;
+    fRxCc = 0;
+    fRxCqCc = 0;
+    fRxArmSn = 0;
     uint32_t poolBytes = MLX5E_MAX_RX_BUFS * MLX5E_RX_BUF_SIZE;
     fRxBufDesc = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, kIODirectionInOut, poolBytes, 0xFFFFFFF000ULL);
     if (!fRxBufDesc)
         return kIOReturnNoMemory;
     memset(fRxBufDesc->getBytesNoCopy(), 0, poolBytes);
-    IODMACommand *rxMap = NULL;
-    if (mlxMapDMAContiguous(fRxBufDesc, &rxMap, &fRxBufDMA) != kIOReturnSuccess) {
-        fRxBufDesc->release();
-        fRxBufDesc = NULL;
-        return kIOReturnNoMemory;
-    }
-    fRxBufMap = rxMap;
+    kern_return_t kr = mlxMapDMAContiguous(fRxBufDesc, &fRxBufMap,
+                                           &fRxBufDMA);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+
+    kr = cmdCreateCq(MLX5E_DEFAULT_LOG_RQ_SIZE, &fRxCqn,
+                     &fRxCqBuf, &fRxCqDesc, &fRxCqMap, &fRxCqDMA,
+                     &fRxCqDbOffset);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    kr = cmdCreateRq(fRxCqn, &fRqn, &fRxDbOffset);
+    if (kr != kIOReturnSuccess)
+        goto fail;
+    kr = cmdCreateTir(fRqn, fTd, &fTirn);
+    if (kr != kIOReturnSuccess)
+        goto fail;
     /* Post the initial RX WQEs (See mlx5e_post_rx_wqes) */
-    for (uint16_t i = 0; i < (1u << MLX5E_DEFAULT_LOG_RQ_SIZE); i++)
-        postRxWqe(i);
+    for (uint16_t i = 0; i < (1u << MLX5E_DEFAULT_LOG_RQ_SIZE); i++) {
+        kr = postRxWqe(i);
+        if (kr != kIOReturnSuccess)
+            goto fail;
+        fRxPc++;
+    }
+    mlxMemoryBarrier();
+    *fRxRing->getDbRecord() = OSSwapHostToBigInt32(fRxPc);
+    kr = cmdModifyRqReady(fRqn);
+    if (kr != kIOReturnSuccess)
+        goto fail;
     return kIOReturnSuccess;
+
+fail:
+    destroyRxResources();
+    return kr;
 }
 
-void MlxEthernet::destroyTxResources()
+kern_return_t MlxEthernet::destroyTxResources()
 {
-    if (fSqn) {
-        uint8_t in[16] = {};
-        uint8_t out[16] = {};
-        OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_SQ);
-        OSWriteBigInt32(in, 4, fSqn);
-        fCore->exec(MLX_CMD_OP_DESTROY_SQ, in, sizeof(in), out, sizeof(out), 5000);
-        fSqn = 0;
+    kern_return_t kr;
+    if (fSqn != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DESTROY_SQ, fSqn);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fSqn = MLX5E_INVALID_RESOURCE;
     }
-    if (fTxCqn) {
-        cmdDestroyCq(fTxCqn);
-        fTxCqn = 0;
+    for (uint16_t i = 0; i < (1u << MLX5E_DEFAULT_LOG_SQ_SIZE); i++) {
+        mbuf_t m = fTxRing ? fTxRing->getWqeMbuf(i) : NULL;
+        if (m) {
+            mbuf_freem(m);
+            fTxRing->clearWqeMbuf(i);
+        }
+    }
+    if (fTxBufDesc) {
+        mlxUnmapDMA(fTxBufMap);
+        fTxBufMap = NULL;
+        fTxBufDesc->release();
+        fTxBufDesc = NULL;
+        fTxBufDMA = 0;
+    }
+    if (fTxDbOffset != MLX5E_INVALID_RESOURCE) {
+        fCore->getUAR()->freeDbSlots(fTxDbOffset, 2);
+        fTxDbOffset = MLX5E_INVALID_RESOURCE;
+        if (fTxRing) {
+            fTxRing->setDbRecord(NULL);
+            fTxRing->setDbDMA(0);
+        }
+    }
+    if (fTxBfValid) {
+        fCore->getUAR()->freeBfreg(&fTxBf);
+        memset(&fTxBf, 0, sizeof(fTxBf));
+        fTxBfValid = false;
+    }
+    if (fTxCqn != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyCq(fTxCqn);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fTxCqn = MLX5E_INVALID_RESOURCE;
     }
     if (fTxCqDesc) {
+        mlxUnmapDMA(fTxCqMap);
+        fTxCqMap = NULL;
         fTxCqDesc->release();
         fTxCqDesc = NULL;
         fTxCqBuf = NULL;
         fTxCqDMA = 0;
     }
-    if (fTisn) {
-        uint8_t in[16] = {};
-        uint8_t out[16] = {};
-        OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_TIS);
-        OSWriteBigInt32(in, 4, fTisn);
-        fCore->exec(MLX_CMD_OP_DESTROY_TIS, in, sizeof(in), out, sizeof(out), 5000);
-        fTisn = 0;
+    if (fTxCqDbOffset != MLX5E_INVALID_RESOURCE) {
+        fCore->getUAR()->freeDbSlots(fTxCqDbOffset, 2);
+        fTxCqDbOffset = MLX5E_INVALID_RESOURCE;
     }
-    if (fTxDbOffset) {
-        fCore->getUAR()->freeDbSlots(fTxDbOffset, 2);
-        fTxDbOffset = 0;
+    if (fTisn != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DESTROY_TIS, fTisn);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fTisn = MLX5E_INVALID_RESOURCE;
     }
-    if (fTxBf) {
-        fCore->getUAR()->freeBfreg(NULL);
-        fTxBf = NULL;
-    }
+    fTxPc = fTxCc = 0;
+    fTxCqCc = fTxArmSn = 0;
+    return kIOReturnSuccess;
 }
 
-void MlxEthernet::destroyRxResources()
+kern_return_t MlxEthernet::destroyRxResources()
 {
-    if (fTirn) {
-        uint8_t in[16] = {};
-        uint8_t out[16] = {};
-        OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_TIR);
-        OSWriteBigInt32(in, 4, fTirn);
-        fCore->exec(MLX_CMD_OP_DESTROY_TIR, in, sizeof(in), out, sizeof(out), 5000);
-        fTirn = 0;
+    kern_return_t kr;
+    if (fTirn != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DESTROY_TIR, fTirn);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fTirn = MLX5E_INVALID_RESOURCE;
     }
-    if (fRqn) {
-        uint8_t in[16] = {};
-        uint8_t out[16] = {};
-        OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_RQ);
-        OSWriteBigInt32(in, 4, fRqn);
-        fCore->exec(MLX_CMD_OP_DESTROY_RQ, in, sizeof(in), out, sizeof(out), 5000);
-        fRqn = 0;
-    }
-    if (fRxCqn) {
-        cmdDestroyCq(fRxCqn);
-        fRxCqn = 0;
-    }
-    if (fRxCqDesc) {
-        fRxCqDesc->release();
-        fRxCqDesc = NULL;
-        fRxCqBuf = NULL;
-        fRxCqDMA = 0;
-    }
-    if (fRxDbOffset) {
-        fCore->getUAR()->freeDbSlots(fRxDbOffset, 2);
-        fRxDbOffset = 0;
+    if (fRqn != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyObject(MLX_CMD_OP_DESTROY_RQ, fRqn);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fRqn = MLX5E_INVALID_RESOURCE;
     }
     if (fRxBufDesc) {
         mlxUnmapDMA(fRxBufMap);
@@ -936,6 +1380,35 @@ void MlxEthernet::destroyRxResources()
         fRxBufDesc = NULL;
         fRxBufDMA = 0;
     }
+    if (fRxDbOffset != MLX5E_INVALID_RESOURCE) {
+        fCore->getUAR()->freeDbSlots(fRxDbOffset, 2);
+        fRxDbOffset = MLX5E_INVALID_RESOURCE;
+        if (fRxRing) {
+            fRxRing->setDbRecord(NULL);
+            fRxRing->setDbDMA(0);
+        }
+    }
+    if (fRxCqn != MLX5E_INVALID_RESOURCE) {
+        kr = cmdDestroyCq(fRxCqn);
+        if (kr != kIOReturnSuccess)
+            return kr;
+        fRxCqn = MLX5E_INVALID_RESOURCE;
+    }
+    if (fRxCqDesc) {
+        mlxUnmapDMA(fRxCqMap);
+        fRxCqMap = NULL;
+        fRxCqDesc->release();
+        fRxCqDesc = NULL;
+        fRxCqBuf = NULL;
+        fRxCqDMA = 0;
+    }
+    if (fRxCqDbOffset != MLX5E_INVALID_RESOURCE) {
+        fCore->getUAR()->freeDbSlots(fRxCqDbOffset, 2);
+        fRxCqDbOffset = MLX5E_INVALID_RESOURCE;
+    }
+    fRxPc = fRxCc = 0;
+    fRxCqCc = fRxArmSn = 0;
+    return kIOReturnSuccess;
 }
 
 /* ========== mlx5e completion handling (See mlx5e_poll_tx_cq / mlx5e_poll_rx_cq) ========== */
@@ -945,29 +1418,39 @@ void MlxEthernet::pollTxCq()
     /* TX CQ: free the mbufs of completed WQEs (See mlx5e_poll_tx_cq, en_tx.c) */
     if (!fTxRing || !fTxCqBuf)
         return;
+    IOLockLock(fLock);
     MlxCqe64 *cqeBuf = (MlxCqe64 *)fTxCqBuf;
     uint32_t size = 1u << MLX5E_DEFAULT_LOG_SQ_SIZE;
-    uint32_t ci = fTxCc & (size - 1);
+    uint32_t ci = fTxCqCc & (size - 1);
     MlxCqe64 *cqe = &cqeBuf[ci];
-    uint8_t sw_owner = (fTxCc >> MLX5E_DEFAULT_LOG_SQ_SIZE) & 1;
-    while ((cqe->op_own & 1) == sw_owner) {
+    uint8_t sw_owner = (fTxCqCc >> MLX5E_DEFAULT_LOG_SQ_SIZE) & 1;
+    while (MLX_CQE_GET_OPCODE(cqe) != MLX_CQE_INVALID &&
+           (cqe->op_own & 1) == sw_owner) {
         mlxMemoryBarrier();
-        /* Free the mbuf associated with this WQE (See mlx5e_tx_wqe_info.skb) */
-        uint16_t wqe_ix = (uint16_t)(OSSwapBigToHostInt32(cqe->wqe_counter) & 0xFFFF) & (size - 1);
-        mbuf_t m = fTxRing->getWqeMbuf(wqe_ix);
-        if (m) {
-            mbuf_freem(m);
-            fTxRing->clearWqeMbuf(wqe_ix);
-        }
-        fTxCc++;
-        ci = fTxCc & (size - 1);
+        uint16_t target = OSSwapBigToHostInt16(cqe->wqe_counter);
+        do {
+            uint16_t wqe_ix = fTxCc & (size - 1);
+            mbuf_t m = fTxRing->getWqeMbuf(wqe_ix);
+            if (m) {
+                mbuf_freem(m);
+                fTxRing->clearWqeMbuf(wqe_ix);
+            }
+            bool last = fTxCc == target;
+            fTxCc++;
+            if (last)
+                break;
+        } while (fTxCc != fTxPc);
+        fTxCqCc++;
+        ci = fTxCqCc & (size - 1);
         cqe = &cqeBuf[ci];
-        sw_owner = (fTxCc >> MLX5E_DEFAULT_LOG_SQ_SIZE) & 1;
+        sw_owner = (fTxCqCc >> MLX5E_DEFAULT_LOG_SQ_SIZE) & 1;
     }
-    /* Update the CQ doorbell record (See mlx5_cqwq_update_db_record) */
-    uint32_t *db = fCore->getUAR()->getDbRecord();
-    if (db)
-        db[fTxCqDbOffset / 4] = OSSwapHostToBigInt32(fTxCc & 0xFFFFFF);
+    updateCqConsumer(fTxCqDbOffset, fTxCqCc);
+    armCq(fTxCqn, fTxCqDbOffset, fTxArmSn, fTxCqCc);
+    IOLockUnlock(fLock);
+    IOOutputQueue *queue = getOutputQueue();
+    if (queue)
+        queue->service();
 }
 
 void MlxEthernet::pollRxCq()
@@ -976,20 +1459,20 @@ void MlxEthernet::pollRxCq()
         return;
     MlxCqe64 *cqeBuf = (MlxCqe64 *)fRxCqBuf;
     uint32_t size = 1u << MLX5E_DEFAULT_LOG_RQ_SIZE;
-    uint32_t ci = fRxCc & (size - 1);
+    uint32_t ci = fRxCqCc & (size - 1);
     MlxCqe64 *cqe = &cqeBuf[ci];
-    uint8_t sw_owner = (fRxCc >> MLX5E_DEFAULT_LOG_RQ_SIZE) & 1;
-    while ((cqe->op_own & 1) == sw_owner) {
+    uint8_t sw_owner = (fRxCqCc >> MLX5E_DEFAULT_LOG_RQ_SIZE) & 1;
+    while (MLX_CQE_GET_OPCODE(cqe) != MLX_CQE_INVALID &&
+           (cqe->op_own & 1) == sw_owner) {
         mlxMemoryBarrier();
         handleRxCqe(cqe);
-        fRxCc++;
-        ci = fRxCc & (size - 1);
+        fRxCqCc++;
+        ci = fRxCqCc & (size - 1);
         cqe = &cqeBuf[ci];
-        sw_owner = (fRxCc >> MLX5E_DEFAULT_LOG_RQ_SIZE) & 1;
+        sw_owner = (fRxCqCc >> MLX5E_DEFAULT_LOG_RQ_SIZE) & 1;
     }
-    uint32_t *db = fCore->getUAR()->getDbRecord();
-    if (db)
-        db[fRxCqDbOffset / 4] = OSSwapHostToBigInt32(fRxCc & 0xFFFFFF);
+    updateCqConsumer(fRxCqDbOffset, fRxCqCc);
+    armCq(fRxCqn, fRxCqDbOffset, fRxArmSn, fRxCqCc);
 }
 
 kern_return_t MlxEthernet::postRxWqe(uint16_t index)
@@ -1005,23 +1488,66 @@ kern_return_t MlxEthernet::postRxWqe(uint16_t index)
     memset(wqe, 0, 64);
     struct MlxWqeDataSeg *dseg = (struct MlxWqeDataSeg *)wqe;
     dseg->byte_count = OSSwapHostToBigInt32(MLX5E_RX_BUF_SIZE);
-    dseg->lkey = OSSwapHostToBigInt32(0x1);
+    dseg->lkey = OSSwapHostToBigInt32(fLkey);
     dseg->addr = OSSwapHostToBigInt64(fRxBufDMA + (uint64_t)index * MLX5E_RX_BUF_SIZE);
     mlxMemoryBarrier();
     return kIOReturnSuccess;
 }
 
+void MlxEthernet::updateCqConsumer(uint32_t dbOffset, uint32_t consumer)
+{
+    if (dbOffset == MLX5E_INVALID_RESOURCE || !fCore || !fCore->getUAR())
+        return;
+    uint32_t *db = fCore->getUAR()->getDbRecord();
+    if (db) {
+        db[dbOffset / 4] =
+            OSSwapHostToBigInt32(consumer & 0x00ffffff);
+        mlxMemoryBarrier();
+    }
+}
+
+void MlxEthernet::armCq(uint32_t cqn, uint32_t dbOffset, uint32_t armSn,
+                        uint32_t consumer)
+{
+    if (cqn == MLX5E_INVALID_RESOURCE ||
+        dbOffset == MLX5E_INVALID_RESOURCE || !fCore || !fCore->getUAR())
+        return;
+    MlxUAR *uar = fCore->getUAR();
+    uint32_t *db = uar->getDbRecord();
+    IOMemoryMap *uarMap = uar->getUarMap();
+    if (!db || !uarMap)
+        return;
+    uint32_t arm = ((armSn & 3) << 28) | (consumer & 0x00ffffff);
+    db[dbOffset / 4 + 1] = OSSwapHostToBigInt32(arm);
+    mlxMemoryBarrier();
+    alignas(8) uint32_t doorbell[2] = {
+        OSSwapHostToBigInt32(arm),
+        OSSwapHostToBigInt32(cqn & 0x00ffffff)
+    };
+    volatile uint64_t *mmio = reinterpret_cast<volatile uint64_t *>(
+        static_cast<uintptr_t>(uarMap->getVirtualAddress()) + MLX_CQ_DOORBELL);
+    *mmio = *reinterpret_cast<uint64_t *>(doorbell);
+    OSSynchronizeIO();
+}
+
 void MlxEthernet::handleEvent(uint32_t type, void *eqe)
 {
+    if (type == MLX_EVENT_TYPE_PORT_STATE_CHANGE) {
+        setLinkState(queryLinkState(), 0);
+        return;
+    }
     /* EQ completion event → poll the matching CQ (See mlx5e_completion_event) */
     if (type != MLX_EVENT_TYPE_COMPLETION || !eqe)
         return;
     MlxEqe *eq = (MlxEqe *)eqe;
     uint32_t cqn = OSSwapBigToHostInt32(eq->data.comp.cqn) & 0xFFFFFF;
-    if (cqn == fTxCqn)
+    if (cqn == fTxCqn) {
+        fTxArmSn++;
         pollTxCq();
-    else if (cqn == fRxCqn)
+    } else if (cqn == fRxCqn) {
+        fRxArmSn++;
         pollRxCq();
+    }
 }
 
 /* ========== MlxEthernetDriver ========== */
@@ -1058,16 +1584,27 @@ bool MlxEthernetDriver::start(IOService *provider)
     fEth = OSTypeAlloc(MlxEthernet);
     if (!fEth || !fEth->init()) {
         IOLog("MlxEthernetDriver: controller init failed\n");
-        return false;
+        goto fail;
     }
     if (!fEth->start(provider)) {
         fEth->release();
         fEth = NULL;
-        return false;
+        goto fail;
     }
     fEth->attach(provider);
     fEth->registerService();
     return true;
+
+fail:
+    if (fEth) {
+        fEth->release();
+        fEth = NULL;
+    }
+    if (fCore) {
+        fCore->release();
+        fCore = NULL;
+    }
+    return false;
 }
 
 void MlxEthernetDriver::stop(IOService *provider)
@@ -1086,5 +1623,13 @@ void MlxEthernetDriver::stop(IOService *provider)
 
 void MlxEthernetDriver::free()
 {
+    if (fEth) {
+        fEth->release();
+        fEth = NULL;
+    }
+    if (fCore) {
+        fCore->release();
+        fCore = NULL;
+    }
     super2::free();
 }

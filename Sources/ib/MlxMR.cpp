@@ -181,7 +181,7 @@ kern_return_t MlxMR::cmdDestroyMKey(uint32_t mkey)
     uint8_t in[16] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_MKEY);
-    OSWriteBigInt32(in, 4, mkey);
+    mlxSetBits(in, 0x48, 24, mkey);
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
                         MLX_CMD_OP_DESTROY_MKEY };
     return fCore->exec(MLX_CMD_OP_DESTROY_MKEY, in, sizeof(in),

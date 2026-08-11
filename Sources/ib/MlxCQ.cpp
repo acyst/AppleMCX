@@ -104,7 +104,7 @@ kern_return_t MlxCQ::cmdDestroyCQ(uint32_t cqNumber)
     uint8_t in[16] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_DESTROY_CQ);
-    OSWriteBigInt32(in, 4, cqNumber);
+    mlxSetBits(in, 0x48, 24, cqNumber);
     MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
                         MLX_CMD_OP_DESTROY_CQ };
     return fRoce->getCore()->exec(MLX_CMD_OP_DESTROY_CQ, in, sizeof(in),

@@ -210,10 +210,15 @@ struct MlxCqe64 {
 
 enum {
     MLX_CQE_REQ      = 0,
-    MLX_CQE_RESP_ERR = 1,
+    MLX_CQE_RESP_WR_IMM = 1,
     MLX_CQE_RESP     = 2,
-    MLX_CQE_REQ_ERR  = 4,
-    MLX_CQE_SIG_ERR  = 8,
+    MLX_CQE_RESP_SEND_IMM = 3,
+    MLX_CQE_RESP_SEND_INV = 4,
+    MLX_CQE_RESIZE_CQ = 5,
+    MLX_CQE_SIG_ERR  = 12,
+    MLX_CQE_REQ_ERR  = 13,
+    MLX_CQE_RESP_ERR = 14,
+    MLX_CQE_INVALID  = 15,
 };
 
 /* Compute static checks

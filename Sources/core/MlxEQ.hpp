@@ -18,7 +18,6 @@
 
 #define MLX_EVENT_TYPE_MAX      64
 #define MLX_NUM_ASYNC_EQS       3       /* cmd/async/pages */
-#define MLX_NUM_SPARE_EQE       128     /* number of spare EQEs (See eq.h:35) */
 #define MLX_MAX_EVENT_NOTIFIERS 4
 #define MLX_MAX_EQ_PAGES        32
 
@@ -59,6 +58,7 @@ struct MlxEqEntry {
     uint32_t     logSize;       /* log2 of the depth */
     uint32_t     consIndex;     /* consumer index */
     uint32_t     eqNumber;
+    bool         valid;
     uint32_t     doorbellOffset; /* UAR + MLX_EQ_DOORBELL */
     uint32_t     irqVector;
     IOBufferMemoryDescriptor *fDesc;  /* ring buffer memory descriptor */
@@ -85,7 +85,8 @@ public:
 
     /* Register MSI-X interrupts (IOInterruptEventSource) */
     kern_return_t setupInterrupts();
-    void shutdown();
+    bool shutdown();
+    void markHardwareStopped();
     virtual void free() APPLE_KEXT_OVERRIDE;
 
     /* Subscribe to events (register for a specific type) */

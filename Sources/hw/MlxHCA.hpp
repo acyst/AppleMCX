@@ -60,6 +60,7 @@ struct MlxHcaCaps {
 
     /* hardware features */
     bool     uar4k;             /* 4K UAR support */
+    uint8_t  logBfRegSize;      /* log2 bytes per BF register */
     bool     swRoceSrcUdpPort;  /* RoCEv2 source UDP port settable */
 
     /* IB capabilities (reserved for plan C) */
