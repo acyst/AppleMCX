@@ -13,6 +13,8 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
+    env:
+      ENABLE_SSH_DEBUG: ${{ secrets.ENABLE_SSH_DEBUG }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,3 +90,10 @@ jobs:
           name: AppleMCX.kext-arm64e
           path: AppleMCX.kext
           if-no-files-found: error
+
+      - name: Start SSH debug session on failure
+        if: failure() && env.ENABLE_SSH_DEBUG == 'true'
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access: true
+          timeout-minutes: 15
