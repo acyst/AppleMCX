@@ -120,8 +120,7 @@ void MlxRoCE::cleanupResources()
         eq->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
         eq->unregisterNotifier(MLX_EVENT_TYPE_DEVICE_FATAL, this);
         eq->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE, this);
-        eq->unregisterNotifier(MLX_EVENT_TYPE_GID_CHANGE, this);
-        eq->unregisterNotifier(MLX_EVENT_TYPE_CLIENT_REREGISTER, this);
+        eq->synchronizeCallbacks();
     }
     if (fQP) { fQP->release(); fQP = NULL; }
     if (fCQ) { fCQ->release(); fCQ = NULL; }
@@ -226,8 +225,6 @@ bool MlxRoCE::stageDevRes()
     eq->registerNotifier(MLX_EVENT_TYPE_COMPLETION, this);
     eq->registerNotifier(MLX_EVENT_TYPE_DEVICE_FATAL, this);
     eq->registerNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE, this);
-    eq->registerNotifier(MLX_EVENT_TYPE_GID_CHANGE, this);
-    eq->registerNotifier(MLX_EVENT_TYPE_CLIENT_REREGISTER, this);
     return true;
 }
 
@@ -254,22 +251,18 @@ void MlxRoCE::handleEvent(uint32_t type, void *eqe)
         queueAsyncEvent(MLX_EVENT_DEVICE_FATAL, MLX_ASYNC_ELEMENT_DEVICE, 0);
         break;
     case MLX_EVENT_TYPE_PORT_STATE_CHANGE: {
-        /* Port state change (see mlx5_ib_event, main.c:2809)
-         * sub_type: 1=active 0=down */
+        /* Raw mlx5 subtypes: 1=down, 4=active, 5=initialized. */
         uint8_t sub = eqePtr ? eqePtr->sub_type : 0;
         IOLog("MlxRoCE: port state change (sub=%u)\n", sub);
-        queueAsyncEvent(sub ? MLX_EVENT_PORT_ACTIVE : MLX_EVENT_PORT_ERR,
-                        MLX_ASYNC_ELEMENT_PORT, 1);   /* port_num=1 */
+        if (sub == 4 || sub == 1)
+            queueAsyncEvent(sub == 4 ? MLX_EVENT_PORT_ACTIVE : MLX_EVENT_PORT_ERR,
+                            MLX_ASYNC_ELEMENT_PORT, 1);
+        else if (sub == 8)
+            queueAsyncEvent(MLX_EVENT_GID_CHANGE, MLX_ASYNC_ELEMENT_PORT, 1);
+        else if (sub == 9)
+            queueAsyncEvent(MLX_EVENT_DEVICE_FATAL, MLX_ASYNC_ELEMENT_PORT, 1);
         break;
     }
-    case MLX_EVENT_TYPE_GID_CHANGE:
-        IOLog("MlxRoCE: GID change event\n");
-        queueAsyncEvent(MLX_EVENT_GID_CHANGE, MLX_ASYNC_ELEMENT_PORT, 1);
-        break;
-    case MLX_EVENT_TYPE_CLIENT_REREGISTER:
-        IOLog("MlxRoCE: client re-register event\n");
-        queueAsyncEvent(MLX_EVENT_DEVICE_FATAL, MLX_ASYNC_ELEMENT_PORT, 1);
-        break;
     case MLX_EVENT_TYPE_COMPLETION: {
         /* CQ completion event → dispatch to the corresponding CQ (see mlx5_eq_comp_int, eq.c:106)
          * eqe->data.comp.cqn → CQ completion callback */

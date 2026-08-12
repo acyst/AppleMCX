@@ -18,6 +18,7 @@
 #include "MlxUAR.hpp"
 #include "MlxHealth.hpp"
 #include "MlxDMA.hpp"
+#include "MlxFwPages.hpp"
 
 class MlxRoCE;
 class MlxEthernetDriver;
@@ -58,6 +59,7 @@ public:
 
     /* RoCE remains opt-in until the isolated userspace ABI is implemented. */
     bool rocePublicationAllowed() const;
+    void enterDmaQuarantine(uint32_t reason);
 
 private:
     /* Firmware initialization sequence (See mlx5_function_setup, main.c:1361) */
@@ -69,7 +71,9 @@ private:
     bool teardownHca();
     bool disableHca();
     bool queryHcaCaps();
+    bool queryHcaCap(uint16_t type, uint16_t mode, uint8_t *capability);
     void cleanup();
+    bool disableBusMasterAndVerify();
 
     /* Capability negotiation (See handle_hca_cap, main.c:712) */
     bool negotiateRoceCap();
@@ -85,12 +89,18 @@ private:
     MlxHCA          *fHCA;
     MlxHealth       *fHealth;
     MlxDMA          *fDMA;
+    MlxFwPages      *fFwPages;
     MlxRoCE         *fRoCE;
     MlxEthernetDriver *fEth;
     uint16_t         fDeviceId;
     uint32_t         fIssi;       /* ISSI version (0 or 1), filled after setIssi */
     uint32_t         fDevIdx;     /* device index (multiple devices) */
     char             fDevName[16];/* device name mlx5_N */
+    bool             fHcaEnabled;
+    bool             fHcaInitialized;
+    bool             fRuntimePagesStarted;
+    bool             fStopping;
+    bool             fDmaQuarantined;
 };
 
 #endif /* MLX_PCI_DRIVER_HPP */

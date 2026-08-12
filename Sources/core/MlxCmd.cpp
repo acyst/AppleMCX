@@ -11,6 +11,7 @@
 #include "MlxCmd.hpp"
 #include "MlxPCIDriver.hpp"
 #include "MlxKernelCompat.hpp"
+#include "MlxP1Encoding.hpp"
 
 #include <string.h>
 #include <libkern/OSTypes.h>
@@ -55,6 +56,10 @@ void MlxCmd::free()
         IOSimpleLockFree(fTokenLock);
         fTokenLock = NULL;
     }
+    if (fPageLock) {
+        IOLockFree(fPageLock);
+        fPageLock = NULL;
+    }
     super::free();
 }
 
@@ -84,6 +89,7 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
     fCmdBufMap = NULL;
     fAllocLock = NULL;
     fTokenLock = NULL;
+    fPageLock = NULL;
     fCmdBuf = NULL;
     memset(fEntArr, 0, sizeof(fEntArr));
 
@@ -111,7 +117,7 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
         return false;
     }
     uint32_t queueSize = 1u << fLogSz;
-    if (queueSize == 0 || queueSize > MLX_MAX_COMMANDS ||
+    if (queueSize < 2 || queueSize > MLX_MAX_COMMANDS ||
         fLogSz > 5 ||
         cmdqSize < (1u << (fLogSz + fLogStride))) {
         IOLog("MlxCmd: command queue too large log_sz=%u\n", fLogSz);
@@ -147,7 +153,8 @@ bool MlxCmd::init(MlxPCIDriver *owner, IOMemoryMap *bar0, uint32_t cmdqSize)
     fBitmask = fMaxRegCmds ? ((1u << fMaxRegCmds) - 1) : 0;
     fAllocLock = IOSimpleLockAlloc();
     fTokenLock = IOSimpleLockAlloc();
-    if (!fAllocLock || !fTokenLock) {
+    fPageLock = IOLockAlloc();
+    if (!fAllocLock || !fTokenLock || !fPageLock) {
         mlxUnmapDMA(fCmdBufMap);
         fCmdBufMap = NULL;
         fCmdBufDesc->release();
@@ -336,17 +343,29 @@ kern_return_t MlxCmd::exec(MlxCmdInOut *cmd, uint32_t timeoutMs)
         return kIOReturnNotReady;
     if (!cmd || !cmd->in || cmd->inSize == 0 ||
         cmd->inSize > MLX_CMD_MAX_SIZE || cmd->outSize > MLX_CMD_MAX_SIZE ||
-        (cmd->outSize && !cmd->out))
+        !cmd->out || cmd->outSize < 8)
         return kIOReturnBadArgument;
 
+    bool pageCommand = cmd->opcode == MLX_CMD_OP_MANAGE_PAGES;
     uint32_t idx;
-    if (!allocIdx(&idx))
+    if (pageCommand) {
+        IOLockLock(fPageLock);
+        idx = fMaxRegCmds;
+        if (fEntArr[idx]) {
+            IOLockUnlock(fPageLock);
+            return kIOReturnBusy;
+        }
+    } else if (!allocIdx(&idx)) {
         return kIOReturnNoSpace;
+    }
 
     /* Build the in-flight entity */
     MlxCmdEnt *ent = static_cast<MlxCmdEnt *>(IOMallocZero(sizeof(MlxCmdEnt)));
     if (!ent) {
-        freeIdx(idx);
+        if (pageCommand)
+            IOLockUnlock(fPageLock);
+        else
+            freeIdx(idx);
         return kIOReturnNoMemory;
     }
     ent->idx = idx;
@@ -360,7 +379,10 @@ kern_return_t MlxCmd::exec(MlxCmdInOut *cmd, uint32_t timeoutMs)
     /* Allocate mailbox (large command) */
     kern_return_t kr = allocMailbox(ent, cmd->inSize, cmd->outSize);
     if (kr != kIOReturnSuccess) {
-        freeIdx(idx);
+        if (pageCommand)
+            IOLockUnlock(fPageLock);
+        else
+            freeIdx(idx);
         fEntArr[idx] = NULL;
         IOFree(ent, sizeof(MlxCmdEnt));
         return kr;
@@ -369,7 +391,10 @@ kern_return_t MlxCmd::exec(MlxCmdInOut *cmd, uint32_t timeoutMs)
     kr = submit(idx, cmd);
     if (kr != kIOReturnSuccess) {
         freeMailbox(ent);
-        freeIdx(idx);
+        if (pageCommand)
+            IOLockUnlock(fPageLock);
+        else
+            freeIdx(idx);
         fEntArr[idx] = NULL;
         IOFree(ent, sizeof(MlxCmdEnt));
         return kr;
@@ -399,6 +424,8 @@ kern_return_t MlxCmd::exec(MlxCmdInOut *cmd, uint32_t timeoutMs)
         fQuarantined = true;
         IOLog("MlxCmd: opcode 0x%x timed out; command interface quarantined\n",
               cmd->opcode);
+        if (pageCommand)
+            IOLockUnlock(fPageLock);
         return kIOReturnTimeout;
     }
 
@@ -416,15 +443,61 @@ kern_return_t MlxCmd::exec(MlxCmdInOut *cmd, uint32_t timeoutMs)
         }
     }
 
-    /* Status: status_own >> 1 */
+    /* Descriptor delivery and IFC outbox status are separate success gates. */
     uint8_t status = (ent->lay->status_own >> 1) & 0x7F;
-    kern_return_t result = (status == 0) ? kIOReturnSuccess : kIOReturnIOError;
+    kern_return_t result = status == 0 ? kIOReturnSuccess : kIOReturnIOError;
     if (result != kIOReturnSuccess) {
-        IOLog("MlxCmd: opcode=%04x firmware error status=%u\n", cmd->opcode, status);
+        IOLog("MlxCmd: opcode=%04x delivery_status=%u\n", cmd->opcode, status);
+    } else {
+        MlxP1OutboxStatus outbox = {};
+        mlxP1ParseOutbox(static_cast<const uint8_t *>(cmd->out),
+                         cmd->outSize, &outbox);
+        if (outbox.status) {
+            switch (outbox.status) {
+            case 2:
+                result = kIOReturnUnsupported;
+                break;
+            case 3:
+            case 5:
+            case 9:
+            case 0x0a:
+            case 0x10:
+            case 0x30:
+            case 0x40:
+                result = kIOReturnBadArgument;
+                break;
+            case 6:
+                result = kIOReturnBusy;
+                break;
+            case 8:
+                result = kIOReturnNoResources;
+                break;
+            case 4:
+                result = kIOReturnNotReady;
+                break;
+            case 0x0f:
+                result = kIOReturnNoSpace;
+                break;
+            case 0x50:
+            case 0x51:
+                result = kIOReturnIOError;
+                break;
+            default:
+                result = kIOReturnIOError;
+                break;
+            }
+            uint16_t opMod = static_cast<uint16_t>(
+                mlxGetBits(cmd->in, 0x30, 16));
+            IOLog("MlxCmd: opcode=%04x op_mod=%04x fw_status=%u syndrome=%08x\n",
+                  cmd->opcode, opMod, outbox.status, outbox.syndrome);
+        }
     }
 
     freeMailbox(ent);
-    freeIdx(idx);
+    if (pageCommand)
+        IOLockUnlock(fPageLock);
+    else
+        freeIdx(idx);
     fEntArr[idx] = NULL;
     IOFree(ent, sizeof(MlxCmdEnt));
     return result;
@@ -434,12 +507,15 @@ void MlxCmd::handleCompletion(uint32_t vector)
 {
     /* Event mode: firmware sends a CMD EQE, vector = completion bitmap
      * See cmd.c:1660 mlx5_cmd_comp_handler */
-    uint32_t idx = (uint32_t)__builtin_ctz(vector);
-    if (idx >= MLX_MAX_COMMANDS)
-        return;
-    MlxCmdEnt *ent = fEntArr[idx];
-    if (ent) {
-        ent->done = true;
-        ent->status = kIOReturnSuccess;
+    while (vector) {
+        uint32_t idx = static_cast<uint32_t>(__builtin_ctz(vector));
+        vector &= vector - 1;
+        if (idx >= MLX_MAX_COMMANDS)
+            continue;
+        MlxCmdEnt *ent = fEntArr[idx];
+        if (ent) {
+            ent->done = true;
+            ent->status = kIOReturnSuccess;
+        }
     }
 }

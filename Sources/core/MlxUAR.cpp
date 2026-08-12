@@ -16,6 +16,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/c++/OSData.h>
+#include <mach/vm_param.h>
 
 #define super OSObject
 OSDefineMetaClassAndStructors(MlxUAR, OSObject)
@@ -49,6 +50,7 @@ bool MlxUAR::init(MlxPCIDriver *owner)
     fUarMemDesc = NULL;
     fUarMap = NULL;
     fBootIndex = 0;
+    fUarOffset = 0;
     memset(&fBootUar, 0, sizeof(fBootUar));
     fBootUarValid = false;
     fDbRecord = NULL;
@@ -165,8 +167,9 @@ uint64_t MlxUAR::uarPhys(uint32_t index)
     /* See uar.c:70 uar2pfn:
      *   pfn = (bar_addr >> PAGE_SHIFT) + system_page_index */
     uint64_t barAddr = fOwner->getBar0()->getPhysicalAddress();
-    uint64_t pageIndex = (uint64_t)index << 12;   /* 4K UAR */
-    return barAddr + pageIndex;
+    uint64_t systemPage = fOwner->getHCA()->caps().uar4k ?
+        (index >> fOwner->getHCA()->caps().logUarPageSize) : index;
+    return barAddr + systemPage * PAGE_SIZE;
 }
 
 kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
@@ -178,16 +181,18 @@ kern_return_t MlxUAR::allocUar(MlxUarAlloc *uar)
 
     uar->index = index;
     uar->phys = uarPhys(index);
+    fUarOffset = fOwner->getHCA()->caps().uar4k ?
+        (index & ((PAGE_SIZE / 4096) - 1)) * 4096 : 0;
     uar->wc = false;
 
     /* Map into the kernel address space (See ioremap, uar.c:124)
      * Use IODeviceMemory to map the UAR page within BAR0 */
     uint64_t phys = uar->phys;
     IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
-        phys, 4096, kIODirectionInOut);
+        phys, PAGE_SIZE, kIODirectionInOut);
     if (desc) {
         IOMemoryMap *map = desc->createMappingInTask(
-            kernel_task, 0, kIOMapAnywhere, 0, 4096);
+            kernel_task, 0, kIOMapAnywhere, 0, PAGE_SIZE);
         if (map) {
             uar->map = reinterpret_cast<void *>(
                 static_cast<uintptr_t>(map->getVirtualAddress()));
@@ -257,7 +262,7 @@ kern_return_t MlxUAR::allocBfreg(MlxBfreg *bfreg)
         return kIOReturnNotReady;
     }
     bfreg->map = reinterpret_cast<void *>(
-        static_cast<uintptr_t>(fUarMap->getVirtualAddress()) + bfreg->offset);
+        static_cast<uintptr_t>(getUarVirtualAddress()) + bfreg->offset);
     IOLog("MlxUAR: BF allocated dbi=%u offset=0x%x\n", dbi, bfreg->offset);
     return kIOReturnSuccess;
 }

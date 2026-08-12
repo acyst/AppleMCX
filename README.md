@@ -1,13 +1,16 @@
 # AppleMCX.kext — Generic Mellanox mlx5 Family Adapter Driver
 
-A macOS (Apple Silicon) driver for Mellanox ConnectX series NICs, providing **RoCEv2** (RDMA over Converged Ethernet) services.
+A research-stage macOS mlx5 driver. ConnectX-5 PF Ethernet bring-up is the first
+controlled hardware target. RoCE code is present but is disabled by default.
 
-**Generic framework**: covers the entire ConnectX family (ConnectX-4 ~ ConnectX-8 + BlueField-3/4), with ConnectX-5 (mcx5) as the first implementation. All hardware structures faithfully mirror Linux `mlx5_core`; classes are uniformly prefixed with `Mlx`.
+The framework recognizes PCI IDs across ConnectX-4 through ConnectX-8 and
+BlueField, but no model is hardware-certified. Command layouts are based on
+MLNX OFED 5.9.
 
 ## Features
 
-- **Full RoCEv2**: RC QP state machine, CQ completion events, zero-copy MR/DMA, AH/GID addressing, DCQCN congestion control
-- **Full family support**: CX4-8 + BlueField, model factory dispatch chain; new models only need a PCI ID
+- **Phase 1 core implementation**: firmware pages, command outbox checking, capability queries, EQ/MSI-X setup, UAR geometry, and health timer
+- **Fail-closed publication**: Ethernet requires queried Ethernet/flow capabilities; RoCE remains off by default
 - **Multi-device**: `deviceName` property + `mlx_list_devices` + verbs multi-device enumeration
 - **IB link-layer reserve**: MlxPortType/IB addressing/AH IB branch
 - **Async event loop closure**: EQ events → MlxUserClient → libmlx → `ibv_get_async_event`
@@ -28,7 +31,7 @@ IOPCIDevice (ConnectX-5)
 
 - **Single KEXT, multiple IOServices**: emulates the Linux auxiliary bus hierarchy, avoiding cross-KEXT dependencies
 - **Hardware decoupling**: all submodules access hardware through the `MlxHCA` abstraction; adding a model requires only a PCI ID + capability deltas
-- **Zero-copy data path**: userspace mmaps UAR to write doorbells directly and reads CQEs directly — no syscalls for RDMA
+- **Userspace data path prototype**: direct UAR/DB mappings are not published by default because per-client isolation is incomplete
 - **DCQCN in pure-firmware loop**: the driver only wraps the `MODIFY_CONG_PARAMS` command
 
 ## Directory Layout
@@ -48,11 +51,11 @@ mlx-kext/
 │   ├── netif/               Ethernet interface (MlxEthernet)
 │   └── userclient/          IOUserClient + MlxUCIO.h (shared userspace header)
 ├── usermode/
-│   ├── libmlx/              Zero-copy userspace library
+│   ├── libmlx/              Userspace data-path prototype library
 │   └── toolchain/           Toolchain (libverbs/libmft + tools)
-├── tests/                   Test tools (ibv_devinfo)
+├── Tests/host/              Host encoder and policy tests
 ├── Tools/                   Build/sign/load scripts
-└── build/stub/              Kernel API stubs (syntax check without SDK)
+└── REMEDIATION_PLAN.md      Safety gates and staged bring-up plan
 ```
 
 ## Building
@@ -65,7 +68,7 @@ make tools                  # build userspace toolchain
 cd usermode/toolchain && make   # or build tools separately
 make sign CODE_SIGN_ID="Apple Development: xxx@yyy.com"   # sign
 sudo make deploy            # deploy to /Library/Extensions
-sudo make load              # load
+sudo make load              # do not use before the Phase 1 hardware gate opens
 make status                 # verify
 ```
 
@@ -76,15 +79,14 @@ Tools/build_kext.sh
 sudo Tools/load_kext.sh
 ```
 
-### Compile-time verification without macOS SDK
-
-`build/stub/` simulates the kernel API (IOKit/libkern), enabling syntax/type checks without an SDK:
+### Host verification without macOS SDK
 
 ```sh
-clang++ -std=c++17 -fno-exceptions -Ibuild/stub -ISources -ISources/hw \
-  -ISources/core -ISources/ib -ISources/netif -ISources/userclient \
-  -fsyntax-only <file>.cpp
+make check-host
 ```
+
+This verifies pure IFC encoders and source safety policies. It does not compile
+the KEXT against the macOS SDK and does not validate hardware behavior.
 
 ## Apple Silicon Developer Mode (Required to Load KEXT)
 
@@ -100,11 +102,13 @@ csrutil status
 # 3. Sign with a development certificate + entitlements (Tools/kext.entitlements)
 ```
 
-> ⚠️ This project is for research/lab validation. Production distribution must consider Apple's KEXT restrictions.
+> This project is for research/lab validation. Do not load it on physical
+> hardware until the Phase 1 gate in `REMEDIATION_PLAN.md` is opened.
 
 ## PCI ID Matching
 
-All-family mlx5 adapters are enabled by default: **ConnectX-4/5/6/7/8** and **BlueField-3/4**.
+The plist recognizes several mlx5 PCI IDs. Recognition does not mean that the
+device has passed firmware, interrupt, DMA, lifecycle, or traffic validation.
 
 ```
 0x101315b3 0x101715b3 0x101b15b3 0x101d15b3 0x101f15b3
@@ -117,21 +121,13 @@ To enable other models, run `Tools/gen_pci_match.sh` to generate the full IOPCIM
 
 | Model | PCI ID | Status |
 |-------|--------|--------|
-| ConnectX-4 | 0x1013 (PF), 0x1014 (VF) | ✅ Adapter ready |
-| ConnectX-4LX | 0x1015 (PF), 0x1016 (VF) | ✅ Adapter ready |
-| ConnectX-5 | 0x1017 (PF), 0x1018 (VF) | ✅ Adapter ready |
-| ConnectX-5Ex | 0x1019 (PF), 0x101A (VF) | ✅ Adapter ready |
-| ConnectX-6 | 0x101B (PF), 0x101C (VF) | ✅ Adapter ready |
-| ConnectX-6 Dx | 0x101D (PF), 0x101E (VF) | ✅ Adapter ready |
-| ConnectX-6 LX | 0x101F | ✅ Adapter ready |
-| ConnectX-7 | 0x1021 (PF), 0x1022 (VF) | ✅ Adapter ready |
-| ConnectX-8 | 0x1023 | ✅ Adapter ready |
-| BlueField-3 (CX7) | 0xa2dc | ✅ Adapter ready |
-| BlueField-4 (CX8) | 0xa2df | ✅ Adapter ready |
+| ConnectX-4/4LX | 0x1013/0x1015 | PCI ID recognized; unverified |
+| ConnectX-5/5Ex | 0x1017/0x1019 | First PF target; not yet hardware verified |
+| ConnectX-6/6Dx/6LX | 0x101B/0x101D/0x101F | PCI ID recognized; unverified |
+| ConnectX-7/8 | 0x1021/0x1023 | PCI ID recognized; unverified |
+| BlueField-3/4 | 0xa2dc/0xa2df | PCI ID recognized; unverified |
 
-> The driver code is common across all ConnectX models (consistent with Linux mlx5_core);
-> differences are limited to PCI IDs, capability registers, and ISSI negotiation
-> (older ConnectX-4 firmware may only support ISSI=0; the driver falls back automatically).
+> No model support claim is made until it passes the validation matrix.
 
 ## Test Tools
 
@@ -150,20 +146,20 @@ cd usermode/toolchain && make
 ./mlnx_qos       # RoCE QoS (PFC / priority mapping)
 ```
 
-perftest tools exchange QPN/RKEY/PSN/GID over TCP `:18515` and complete the QP state
-machine (RST→INIT→RTR→RTS); RDMA Write/Read use the peer RKEY.
+The tools contain a TCP parameter-exchange implementation. RDMA traffic has not
+been executed or verified with this driver.
 
 ## DMA Data Path
 
 ```
-TX: user data → VirtToPhys → WQE data_seg.addr (physical) → doorbell → hardware DMA
+TX: mapped user data → WQE data segment → doorbell → device DMA
 RX: CQE buffer (kernel DMA-coherent) → CQC PAS → hardware writes
-UAR: userspace mmap (clientMemoryForType) → direct doorbell write
+UAR: direct userspace mapping remains disabled by the default RoCE publication gate
 CMD: command queue page (withPhysicalMask)
 EQ:  EQE ring buffer (withPhysicalMask)
 ```
 
-- The kernel-side `MlxDMA` pins user memory to obtain physical addresses (`MlxDMAReq` carries per-segment lengths for precise translation)
+- The kernel-side `MlxDMA` prototype pins user memory and returns device-visible segments
 - QP creation writes SQ/RQ buffer physical addresses into QPC wq_umem PAS
 - CQ creation uses DMA-coherent memory for the CQE buffer
 
@@ -171,19 +167,19 @@ EQ:  EQE ring buffer (withPhysicalMask)
 
 DCQCN congestion-control parameters are configured via `IOConnectCallMethod(kMlxUCMethodCCModify)`,
 defaults: `rpg_min_dec_fac=256, rpg_ai_rate=5, rpg_time_reset=55, rpg_threshold=150`.
-The data path is zero-copy: userspace writes UAR doorbells directly and reads CQEs directly, with no syscalls.
+These controls are not hardware-verified, and the direct userspace data path is
+not enabled by default.
 
 ## Status
 
 | Capability | Status |
 |------------|--------|
-| Command interface / device init / firmware handshake / EQ / UAR / health | ✅ |
-| Ethernet interface (TX/RX) | ✅ |
-| RoCEv2 + RC data path (post_send/poll_cq) | ✅ |
-| Async events: EQ → userspace `ibv_get_async_event` | ✅ |
-| Real perftest TCP handshake (QPN/RKEY/PSN/GID) | ✅ |
-| Multi-device (deviceName / mlx_list_devices) | ✅ |
-| IB link-layer reserve (IB addressing / AH IB branch) | ✅ |
+| Phase 0/1 code implemented | Yes |
+| Host tests | Passing |
+| Current P1 macOS SDK build | Awaiting CI |
+| Hardware and traffic | Not verified |
+| RoCE publication | Disabled by default |
+| Model certification | None |
 
 > Full implementation details: `IMPLEMENTATION_STATUS.md`; Chinese quickstart: `README_zh.md`.
 

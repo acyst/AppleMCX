@@ -1,10 +1,12 @@
 # AppleMCX Remediation Plan
 
-> Baseline: `ce35c32 Harden mlx5e Ethernet hardware data path`
+> Baseline: `a2b3e76 Harden RoCE P0 command encoding`
 >
-> Updated: 2026-08-11
+> Updated: 2026-08-12
 >
-> Status: macOS 26/arm64e build verified; hardware operation not verified.
+> Status: Phase 0 and Phase 1 code implemented and host-tested. The current
+> Phase 1 changes have not yet been verified by the macOS 26 SDK build or on
+> hardware. Hardware operation and traffic remain unverified.
 
 ## 1. Objective
 
@@ -64,7 +66,9 @@ The order is deliberate:
   C byte offsets.
 - Check both command delivery status and firmware outbox status/syndrome.
 - Never release DMA memory until the referencing hardware object is confirmed
-  destroyed or PCI bus mastering is disabled.
+  destroyed and the normal firmware teardown establishes a trusted DMA drain.
+  Clearing PCI bus mastering alone is not treated as proof that in-flight DMA
+  has drained; ambiguous mappings are intentionally retained.
 - Fail closed when capability, interrupt, object state, or DMA behavior cannot
   be established.
 - Do not expose a device-global UAR or DB page to userspace.
@@ -200,6 +204,39 @@ Priority: P0
 
 Goal: implement the required mlx5 initialization contract and make command and
 event success trustworthy.
+
+Implementation status as of 2026-08-12:
+
+- Code implemented: yes.
+- Host-tested: yes, through `make check-host` with ASan/UBSan encoding tests and
+  source policy gates.
+- macOS 26 SDK build verified for these changes: not yet.
+- Hardware verified: no.
+- Traffic verified: no.
+- Phase 1 hardware gate: closed until the macOS CI build succeeds and the
+  remaining hardware-only checks are performed on a controlled ConnectX-5 PF.
+
+Implemented in this phase:
+
+- Command results now require both successful descriptor delivery and a zero
+  IFC outbox status; syndrome and op_mod are logged on failure.
+- `MANAGE_PAGES` uses the reserved page-command slot and remains polling-only.
+- Boot and init firmware pages are queried and provided in OFED order; runtime
+  `PAGE_REQUEST` events are handled by a serialized kernel-priority worker.
+- Firmware-owned pages retain their descriptors and IOMMU mappings until TAKE,
+  release-all, or a trusted graceful teardown. Ambiguous ownership is
+  quarantined and intentionally leaked rather than freed after only clearing
+  bus mastering.
+- `INIT_HCA` uses 32 bytes and `QUERY_HCA_CAP` uses the full 4112-byte output.
+- General, RoCE, Ethernet-offload, and NIC flow-table capabilities are queried
+  separately. Ethernet and RoCE publication remain fail-closed.
+- EQ masks use four 64-bit words, callbacks run outside the registry lock,
+  callback teardown is synchronized, CI is updated within the spare-EQE
+  budget, and every EQ is initially armed.
+- Two MSI-X vectors are explicitly requested and verified before EQ setup.
+- UAR mapping follows negotiated system-page geometry and 4 KiB UAR offsets.
+- Health polling uses a real timer, the real init-segment health counter, a
+  missed-update threshold, and RFR severity before entering quarantine.
 
 ### 5.1 Check Firmware Outbox Status
 
@@ -369,11 +406,29 @@ Acceptance:
 - Timer start/stop is synchronized with device lifecycle.
 - `QueryHealth` reports measured state rather than an initial default.
 
+### Phase 1 Completion Notes
+
+As of 2026-08-12 the Phase 1 work items above are implemented and covered by
+`make check-host` encoding and policy tests. Remaining verification for the
+Phase 1 gate is hardware-only or CI-only:
+
+- macOS 26/arm64e KEXT build of these changes must pass in CI.
+- Firmware command acceptance, page exchange, capability values, MSI-X
+  delivery, EQ/CQ routing, UAR doorbells, and DMA/IOMMU behavior must be
+  confirmed on one controlled ConnectX-5 PF.
+- Abnormal teardown deliberately retains DMA mappings until a trusted drain or
+  reset boundary exists. A hard function reset or IOMMU quiesce API is a
+  prerequisite before those retained mappings may be released.
+- Runtime page requests and health events must be observed on hardware.
+
 ### Phase 1 Gate
 
 Hardware testing may begin only when firmware startup pages, outbox status,
 capabilities, EQ masks, initial arm, and interrupt-source validation are all in
 place.
+
+Current state: code implemented and host-tested; the macOS 26 SDK build and all
+hardware checks are still pending, so the gate is closed.
 
 ## 6. Phase 2: ConnectX-5 Ethernet Bring-Up
 

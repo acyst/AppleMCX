@@ -57,6 +57,10 @@ public:
     /* For user-space mapping */
     IOMemoryDescriptor *getUarMemDesc() { return fUarMemDesc; }
     IOMemoryMap *getUarMap() { return fUarMap; }
+    IOVirtualAddress getUarVirtualAddress() const
+    {
+        return fUarMap ? fUarMap->getVirtualAddress() + fUarOffset : 0;
+    }
 
     /* boot UAR index (used for EQ/CQ uar_page, See priv->uar->index) */
     uint32_t getBootUarIndex() const { return fBootIndex; }
@@ -85,6 +89,7 @@ private:
     IOMemoryMap        *fUarMap;
     uint32_t    fUarBitmap;      /* BF allocation bitmap */
     uint32_t    fBootIndex;      /* boot UAR index */
+    uint32_t    fUarOffset;
     MlxUarAlloc fBootUar;
     bool        fBootUarValid;
     uint32_t   *fDbRecord;       /* DB record page */

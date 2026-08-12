@@ -122,6 +122,12 @@ check-host:
 	    -o build/tests/test_p0_encoding
 	./build/tests/test_p0_encoding
 	python3 Tests/host/test_p0_policy.py
+	clang++ -std=c++17 -Wall -Wextra -Werror \
+	    -fsanitize=address,undefined -fno-omit-frame-pointer \
+	    -ISources/hw Tests/host/test_p1_encoding.cpp \
+	    -o build/tests/test_p1_encoding
+	./build/tests/test_p1_encoding
+	python3 Tests/host/test_p1_policy.py
 
 clean:
 	rm -rf obj build AppleMCX.kext/Contents/MacOS/$(KEXT_NAME)

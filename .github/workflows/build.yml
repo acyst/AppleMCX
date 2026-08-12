@@ -24,7 +24,7 @@ jobs:
           xcodebuild -version
           echo "SDK: $(xcrun --sdk macosx --show-sdk-path)"
 
-      - name: Run P0 host checks
+      - name: Run P0/P1 host checks
         run: make check-host
 
       - name: Build kernel KEXT

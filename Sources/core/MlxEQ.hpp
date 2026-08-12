@@ -16,7 +16,7 @@
 #include <IOKit/IODMACommand.h>
 #include "MlxRegs.hpp"
 
-#define MLX_EVENT_TYPE_MAX      64
+#define MLX_EVENT_TYPE_MAX      256
 #define MLX_NUM_ASYNC_EQS       3       /* cmd/async/pages */
 #define MLX_MAX_EVENT_NOTIFIERS 4
 #define MLX_MAX_EQ_PAGES        32
@@ -29,6 +29,7 @@ class MlxPCIDriver;
 class MlxEventNotifier {
 public:
     virtual void handleEvent(uint32_t type, void *eqe) = 0;
+    virtual OSObject *notifierObject() = 0;
 };
 
 /*
@@ -42,7 +43,13 @@ struct MlxEqe {
     uint32_t rsvd2[7];
     union {
         struct { uint32_t rsvd_c[6]; uint32_t cqn; } comp;  /* completion event */
-        struct { uint32_t rsvd_cmd[6]; uint32_t vector; } cmd; /* command completion bitmap */
+        struct { uint32_t vector; uint32_t rsvd_cmd[6]; } cmd;
+        struct {
+            uint16_t ec_function;
+            uint16_t function_id;
+            uint32_t num_pages;
+            uint32_t rsvd_page[5];
+        } page_request;
     } data;
     uint16_t rsvd3;
     uint8_t  signature;
@@ -65,7 +72,7 @@ struct MlxEqEntry {
     IODMACommand *fDmaMap;      /* retained IOMMU mapping */
     uint64_t     pageDMA[MLX_MAX_EQ_PAGES];
     uint32_t     numPages;
-    uint32_t     eventMask[4];  /* event mask (128-bit) */
+    uint64_t     eventMask[4];  /* event mask (256-bit) */
 };
 
 static_assert(sizeof(MlxEqe) == 64, "mlx5 EQE must be 64 bytes");
@@ -85,6 +92,7 @@ public:
 
     /* Register MSI-X interrupts (IOInterruptEventSource) */
     kern_return_t setupInterrupts();
+    void disableInterrupts();
     bool shutdown();
     void markHardwareStopped();
     virtual void free() APPLE_KEXT_OVERRIDE;
@@ -92,6 +100,7 @@ public:
     /* Subscribe to events (register for a specific type) */
     void registerNotifier(uint32_t eventType, MlxEventNotifier *n);
     void unregisterNotifier(uint32_t eventType, MlxEventNotifier *n);
+    void synchronizeCallbacks();
 
     /* Interrupt handler entry points */
     static void asyncIntrHandler(OSObject *owner,
@@ -104,11 +113,12 @@ public:
     {
         return (vector < fNumCompEqs) ? fCompEqs[vector].eqNumber : 0;
     }
+    uint32_t getNumCompEqs() const { return fNumCompEqs; }
 
 private:
     /* Create a single EQ (See eq.c:272 create_map_eq) */
     kern_return_t createEq(MlxEqEntry *eq, uint32_t vecidx,
-                           const uint32_t mask[4]);
+                           const uint64_t mask[4]);
 
     /* Destroy an EQ */
     kern_return_t destroyEq(uint32_t eqNumber);
@@ -133,9 +143,12 @@ private:
     MlxEventNotifier *fNotifiers[MLX_EVENT_TYPE_MAX][MLX_MAX_EVENT_NOTIFIERS];
     uint32_t        fNotifierCounts[MLX_EVENT_TYPE_MAX];
     IOLock         *fNotifierLock;
+    uint32_t        fActiveCallbacks;
+    bool            fShuttingDown;
     IOWorkLoop     *fWorkLoop;
     IOInterruptEventSource *fAsyncIS;
     IOInterruptEventSource **fCompIS;
+    bool             fInterruptsSetup;
 };
 
 #endif /* MLX_EQ_HPP */

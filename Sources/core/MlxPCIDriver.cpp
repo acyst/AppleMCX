@@ -14,12 +14,14 @@
 #include "MlxUAR.hpp"
 #include "MlxRegs.hpp"
 #include "MlxKernelCompat.hpp"
+#include "MlxP1Encoding.hpp"
 
 #include <stdio.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/c++/OSDictionary.h>
+#include <mach/vm_param.h>
 
 #define super IOService
 OSDefineMetaClassAndStructors(MlxPCIDriver, IOService)
@@ -43,9 +45,15 @@ bool MlxPCIDriver::init(OSDictionary *properties)
     fHCA = NULL;
     fHealth = NULL;
     fDMA = NULL;
+    fFwPages = NULL;
     fRoCE = NULL;
     fEth = NULL;
     fIssi = 0;
+    fHcaEnabled = false;
+    fHcaInitialized = false;
+    fRuntimePagesStarted = false;
+    fStopping = false;
+    fDmaQuarantined = false;
     return true;
 }
 
@@ -102,6 +110,17 @@ bool MlxPCIDriver::start(IOService *provider)
         return false;
     }
 
+    fFwPages = OSTypeAlloc(MlxFwPages);
+    if (!fFwPages || !fFwPages->init(this, false)) {
+        IOLog("MlxPCIDriver: firmware page manager init failed\n");
+        if (fFwPages) {
+            fFwPages->release();
+            fFwPages = NULL;
+        }
+        cleanup();
+        return false;
+    }
+
     /* Firmware handshake sequence (See mlx5_function_setup, main.c:1361) */
     if (!fwInit()) {
         IOLog("MlxPCIDriver: firmware init failed\n");
@@ -132,12 +151,29 @@ bool MlxPCIDriver::start(IOService *provider)
         return false;
     }
 
+    int interruptType = 0;
+    if (fPci->configureInterrupts(kIOInterruptTypePCIMessagedX, 2, 2) !=
+        kIOReturnSuccess ||
+        fPci->getInterruptType(0, &interruptType) != kIOReturnSuccess ||
+        !(interruptType & kIOInterruptTypePCIMessagedX) ||
+        fPci->getInterruptType(1, &interruptType) != kIOReturnSuccess ||
+        !(interruptType & kIOInterruptTypePCIMessagedX)) {
+        IOLog("MlxPCIDriver: control/completion interrupt sources unavailable\n");
+        cleanup();
+        return false;
+    }
     fEQ = OSTypeAlloc(MlxEQ);
-    if (!fEQ || !fEQ->init(this, 4) ||
+    if (!fEQ || !fEQ->init(this, 1) ||
         fEQ->createAsyncEqs() != kIOReturnSuccess ||
         fEQ->createCompEqs() != kIOReturnSuccess ||
-        fEQ->setupInterrupts() != kIOReturnSuccess) {
+        fFwPages->startRuntime(fEQ) != kIOReturnSuccess) {
         IOLog("MlxPCIDriver: EQ initialization failed\n");
+        cleanup();
+        return false;
+    }
+    fRuntimePagesStarted = true;
+    if (fEQ->setupInterrupts() != kIOReturnSuccess) {
+        IOLog("MlxPCIDriver: interrupt setup failed\n");
         cleanup();
         return false;
     }
@@ -149,7 +185,11 @@ bool MlxPCIDriver::start(IOService *provider)
         cleanup();
         return false;
     }
-    fHealth->start(1000000);   /* 1 second interval */
+    if (!fHealth->start(1000000)) {
+        IOLog("MlxPCIDriver: health timer setup failed\n");
+        cleanup();
+        return false;
+    }
 
     /* DMA mapping service (pins user memory on the data path) */
     fDMA = OSTypeAlloc(MlxDMA);
@@ -182,25 +222,61 @@ void MlxPCIDriver::stop(IOService *provider)
 
 void MlxPCIDriver::cleanup()
 {
+    if (fStopping)
+        return;
+    fStopping = true;
     if (fHealth) {
         fHealth->stop();
         fHealth->release();
         fHealth = NULL;
     }
+    if (fEQ)
+        fEQ->disableInterrupts();
+    if (fFwPages && fRuntimePagesStarted) {
+        fFwPages->stopRuntimeAndDrain();
+        fRuntimePagesStarted = false;
+    }
     bool eqDestroyed = !fEQ || fEQ->shutdown();
-    bool hcaStopped = eqDestroyed;
-    if (fCmd && fCmd->isUp()) {
-        /* Stop the HCA before releasing shared DMA/UAR memory. */
-        hcaStopped = teardownHca();
-        if (hcaStopped)
-            hcaStopped = disableHca();
+    bool teardownOk = true;
+    if (fHcaInitialized && fCmd && fCmd->isUp()) {
+        teardownOk = teardownHca();
+        if (teardownOk)
+            fHcaInitialized = false;
+        else
+            fDmaQuarantined = true;
     }
-    if (!hcaStopped && fPci) {
-        /* A failed command teardown cannot be trusted as a DMA boundary. */
+    if (fFwPages && fHcaEnabled && fCmd && fCmd->isUp() &&
+        !fCmd->isQuarantined() && teardownOk &&
+        fFwPages->hasOutstandingPages()) {
+        if (fFwPages->reclaimAll(5000) != kIOReturnSuccess)
+            fDmaQuarantined = true;
+    }
+    if (fHcaEnabled && fCmd && fCmd->isUp()) {
+        if (!disableHca())
+            fDmaQuarantined = true;
+        else
+            fHcaEnabled = false;
+    }
+    if (fDmaQuarantined && fPci)
         fPci->setBusMasterEnable(false);
-        hcaStopped = true;
+    bool gracefulBoundary = eqDestroyed && teardownOk && !fDmaQuarantined &&
+                            (!fCmd || !fCmd->isQuarantined()) &&
+                            (!fFwPages || !fFwPages->hasOutstandingPages());
+    bool busMasterDisabled = disableBusMasterAndVerify();
+    if (!busMasterDisabled) {
+        IOLog("MlxPCIDriver: bus-master-off not verified; DMA resources quarantined\n");
+        return;
     }
-    if (!eqDestroyed && hcaStopped && fEQ)
+    if (!gracefulBoundary) {
+        IOLog("MlxPCIDriver: teardown was not a trusted DMA drain; retaining mappings\n");
+        return;
+    }
+    if (fFwPages) {
+        fFwPages->releaseAfterDmaBoundary();
+        fFwPages->release();
+        fFwPages = NULL;
+    }
+    if (!eqDestroyed && fEQ)
         fEQ->markHardwareStopped();
     if (fDMA) {
         fDMA->release();
@@ -227,7 +303,6 @@ void MlxPCIDriver::cleanup()
         fBar0Map = NULL;
     }
     if (fPci) {
-        fPci->setBusMasterEnable(false);
         fPci->setMemoryEnable(false);
         fPci->release();
         fPci = NULL;
@@ -245,12 +320,19 @@ void MlxPCIDriver::free()
 bool MlxPCIDriver::fwInit()
 {
     /* 1. Wait for firmware to leave pre-init (See wait_fw_init, main.c:281-307) */
+    bool firmwareReady = false;
     for (int i = 0; i < 100; i++) {
         uint32_t init = mlxMMIORead32BE(
             fBar0Map, offsetof(struct MlxInitSeg, initializing));
-        if (!(init & (1u << 31)))
+        if (!(init & (1u << 31))) {
+            firmwareReady = true;
             break;
+        }
         IOSleep(10);
+    }
+    if (!firmwareReady) {
+        IOLog("MlxPCIDriver: firmware remained in pre-initializing state\n");
+        return false;
     }
 
     /* 2. ENABLE_HCA (See mlx5_core_enable_hca, main.c:1401) */
@@ -258,10 +340,17 @@ bool MlxPCIDriver::fwInit()
         IOLog("MlxPCIDriver: ENABLE_HCA failed\n");
         return false;
     }
+    fHcaEnabled = true;
 
     /* 3. Negotiate ISSI (See mlx5_core_set_issi, main.c:1407) */
     if (!setIssi()) {
         IOLog("MlxPCIDriver: SET_ISSI failed\n");
+        return false;
+    }
+
+    if (fFwPages->satisfyStartupPages(kMlxFwPageBoot) !=
+        kIOReturnSuccess) {
+        IOLog("MlxPCIDriver: boot page provisioning failed\n");
         return false;
     }
 
@@ -271,11 +360,18 @@ bool MlxPCIDriver::fwInit()
         return false;
     }
 
+    if (fFwPages->satisfyStartupPages(kMlxFwPageInit) !=
+        kIOReturnSuccess) {
+        IOLog("MlxPCIDriver: init page provisioning failed\n");
+        return false;
+    }
+
     /* 5. INIT_HCA (passes sw_owner_id) */
     if (!initHca()) {
         IOLog("MlxPCIDriver: INIT_HCA failed\n");
         return false;
     }
+    fHcaInitialized = true;
 
     /* 6. Read back the final capabilities */
     if (!queryHcaCaps()) {
@@ -348,14 +444,44 @@ bool MlxPCIDriver::setIssi()
 
 bool MlxPCIDriver::setHcaCaps()
 {
-    /* MVP: capability negotiation is handled after queryHcaCaps reads back;
-     * the full implementation (SET_HCA_CAP) is completed in late phase P0 per handle_hca_cap */
-    return true;
+    uint8_t *maxCap = static_cast<uint8_t *>(IOMallocZero(MLX_P1_HCA_CAP_BYTES));
+    uint8_t *curCap = static_cast<uint8_t *>(IOMallocZero(MLX_P1_HCA_CAP_BYTES));
+    uint8_t *in = static_cast<uint8_t *>(IOMallocZero(MLX_P1_SET_HCA_CAP_IN_BYTES));
+    if (!maxCap || !curCap || !in) {
+        if (maxCap) IOFree(maxCap, MLX_P1_HCA_CAP_BYTES);
+        if (curCap) IOFree(curCap, MLX_P1_HCA_CAP_BYTES);
+        if (in) IOFree(in, MLX_P1_SET_HCA_CAP_IN_BYTES);
+        return false;
+    }
+    bool ok = queryHcaCap(MLX_P1_CAP_GENERAL, MLX_P1_CAP_MAX, maxCap) &&
+              queryHcaCap(MLX_P1_CAP_GENERAL, MLX_P1_CAP_CURRENT, curCap);
+    if (ok) {
+        memcpy(in + MLX_P1_CMD_HEADER_BYTES, curCap, 256);
+        mlxSetBits(in, 0x00, 16, MLX_CMD_OP_SET_HCA_CAP);
+        mlxSetBits(in, 0x30, 16, MLX_P1_CAP_GENERAL << 1);
+        mlxSetBits(in + MLX_P1_CMD_HEADER_BYTES, 0x210, 2, 0);
+        mlxSetBits(in + MLX_P1_CMD_HEADER_BYTES, 0x20f, 1, 1);
+        mlxSetBits(in + MLX_P1_CMD_HEADER_BYTES, 0x145, 1,
+                   mlxGetBits(maxCap, 0x145, 1));
+        uint16_t logUarPageSize = PAGE_SHIFT > 12 ? PAGE_SHIFT - 12 : 0;
+        mlxSetBits(in + MLX_P1_CMD_HEADER_BYTES, 0x240, 1,
+                   PAGE_SIZE > 4096 && mlxGetBits(maxCap, 0x240, 1));
+        mlxSetBits(in + MLX_P1_CMD_HEADER_BYTES, 0x490, 16,
+                   logUarPageSize);
+        uint8_t out[16] = {};
+        MlxCmdInOut cmd = { in, MLX_P1_SET_HCA_CAP_IN_BYTES,
+                            out, sizeof(out), MLX_CMD_OP_SET_HCA_CAP };
+        ok = fCmd->exec(&cmd, 5000) == kIOReturnSuccess;
+    }
+    IOFree(in, MLX_P1_SET_HCA_CAP_IN_BYTES);
+    IOFree(curCap, MLX_P1_HCA_CAP_BYTES);
+    IOFree(maxCap, MLX_P1_HCA_CAP_BYTES);
+    return ok;
 }
 
 bool MlxPCIDriver::initHca()
 {
-    uint8_t in[16] = {};
+    uint8_t in[MLX_P1_INIT_HCA_IN_BYTES] = {};
     uint8_t out[16] = {};
     OSWriteBigInt16(in, 0, MLX_CMD_OP_INIT_HCA);
     /* sw_owner_id: 24 bytes, zeroed in MVP */
@@ -386,40 +512,104 @@ bool MlxPCIDriver::disableHca()
 
 bool MlxPCIDriver::queryHcaCaps()
 {
-    /* QUERY_HCA_CAP → parse fHCA->caps()
-     * See mlx5_query_hca_caps (main.c:1455) */
-    uint8_t in[32] = {};
-    uint8_t out[1024] = {};
-    OSWriteBigInt16(in, 0, MLX_CMD_OP_QUERY_HCA_CAP);
-    mlxSetBits(in, 0x30, 16, 1);        /* current general capability */
-    MlxCmdInOut cmd = { in, sizeof(in), out, sizeof(out),
-                        MLX_CMD_OP_QUERY_HCA_CAP };
-    if (fCmd->exec(&cmd, 5000) != kIOReturnSuccess)
+    uint8_t *general = static_cast<uint8_t *>(IOMallocZero(MLX_P1_HCA_CAP_BYTES));
+    uint8_t *roce = static_cast<uint8_t *>(IOMallocZero(MLX_P1_HCA_CAP_BYTES));
+    uint8_t *flow = static_cast<uint8_t *>(IOMallocZero(MLX_P1_HCA_CAP_BYTES));
+    uint8_t *ethernet = static_cast<uint8_t *>(IOMallocZero(MLX_P1_HCA_CAP_BYTES));
+    if (!general || !roce || !flow || !ethernet) {
+        if (general) IOFree(general, MLX_P1_HCA_CAP_BYTES);
+        if (roce) IOFree(roce, MLX_P1_HCA_CAP_BYTES);
+        if (flow) IOFree(flow, MLX_P1_HCA_CAP_BYTES);
+        if (ethernet) IOFree(ethernet, MLX_P1_HCA_CAP_BYTES);
         return false;
-
-    const uint8_t *cap = out + 16; /* query_hca_cap_out capability@bit 0x80 */
+    }
+    bool ok = queryHcaCap(MLX_P1_CAP_GENERAL, MLX_P1_CAP_CURRENT, general);
+    MlxP1GeneralCaps parsed = {};
+    MlxP1RoceCaps parsedRoce = {};
+    MlxP1FlowCaps parsedFlow = {};
+    MlxP1EthernetCaps parsedEthernet = {};
+    ok = ok && mlxP1ParseGeneralCaps(general, MLX_P1_HCA_CAP_BYTES, &parsed);
+    bool haveRoce = parsed.roce &&
+        queryHcaCap(MLX_P1_CAP_ROCE, MLX_P1_CAP_CURRENT, roce) &&
+        mlxP1ParseRoceCaps(roce, MLX_P1_HCA_CAP_BYTES, &parsedRoce);
+    bool haveFlow = parsed.nicFlowTable &&
+        queryHcaCap(MLX_P1_CAP_FLOW_TABLE, MLX_P1_CAP_CURRENT, flow) &&
+        mlxP1ParseFlowCaps(flow, MLX_P1_HCA_CAP_BYTES, &parsedFlow);
+    bool haveEthernet = parsed.ethNetOffloads &&
+        queryHcaCap(MLX_P1_CAP_ETHERNET_OFFLOADS, MLX_P1_CAP_CURRENT,
+                    ethernet) &&
+        mlxP1ParseEthernetCaps(ethernet, MLX_P1_HCA_CAP_BYTES,
+                               &parsedEthernet);
+    if (!ok) {
+        IOFree(flow, MLX_P1_HCA_CAP_BYTES);
+        IOFree(roce, MLX_P1_HCA_CAP_BYTES);
+        IOFree(general, MLX_P1_HCA_CAP_BYTES);
+        IOFree(ethernet, MLX_P1_HCA_CAP_BYTES);
+        return false;
+    }
     MlxHcaCaps &caps = fHCA->mutableCaps();
     memset(&caps, 0, sizeof(caps));
     caps.fwRev = mlxMMIORead32BE(
         fBar0Map, offsetof(struct MlxInitSeg, fw_rev));
     caps.cmdifRev = fCmd->cmdifRev();
-    caps.maxQp = 1u << mlxGetBits(cap, 0x9b, 5);
-    caps.maxCq = 1u << mlxGetBits(cap, 0xdb, 5);
-    caps.maxMr = 1u << mlxGetBits(cap, 0xea, 6);
-    caps.portType = static_cast<uint8_t>(mlxGetBits(cap, 0x1b6, 2));
-    caps.numPorts = static_cast<uint32_t>(mlxGetBits(cap, 0x1b8, 8));
-    caps.roce = mlxGetBits(cap, 0x21e, 1) != 0;
-    caps.uar4k = mlxGetBits(cap, 0x2a6, 1) != 0;
-    caps.logBfRegSize = static_cast<uint8_t>(mlxGetBits(cap, 0x26b, 5));
-    caps.roceRwSupported = mlxGetBits(cap, 0x33f, 1) != 0;
-    caps.roceMaxGid = static_cast<uint16_t>(mlxGetBits(cap, 0x170, 16));
-    caps.roceVersions = caps.roce ? 0x3 : 0;
-    caps.roceDstUdpPort = MLX_ROCE_V2_UDP_DPORT;
+    caps.maxQp = mlxP1LogResourceSize(parsed.logMaxQp);
+    caps.maxCq = mlxP1LogResourceSize(parsed.logMaxCq);
+    caps.maxMr = mlxP1LogResourceSize(parsed.logMaxMkey);
+    caps.portType = parsed.portType;
+    caps.numPorts = parsed.numPorts;
+    caps.roce = haveRoce;
+    caps.uar4k = parsed.uar4k;
+    caps.logUarPageSize = static_cast<uint16_t>(
+        mlxGetBits(general, 0x490, 16));
+    caps.logBfRegSize = parsed.bf ? parsed.logBfRegSize : 0;
+    caps.roceRwSupported = parsed.roceRwSupported;
+    caps.roceMaxGid = haveRoce ? parsedRoce.addressTableSize : 0;
+    caps.roceVersions = haveRoce ?
+        mlxP1RoceVersionsForAbi(parsedRoce.versions) : 0;
+    caps.roceDstUdpPort = haveRoce ? parsedRoce.destinationUdpPort : 0;
+    caps.roceMinSrcUdpPort = haveRoce ? parsedRoce.minimumSourceUdpPort : 0;
+    caps.swRoceSrcUdpPort = haveRoce && parsedRoce.sourceUdpPortWritable;
+    caps.nicFlowTable = haveFlow && parsedFlow.nicRx && parsedFlow.nicTx;
+    caps.ethNetOffloads = haveEthernet && parsedEthernet.checksum &&
+                          parsedEthernet.vlan;
     caps.ibSupported = caps.portType == MLX_PORT_TYPE_IB;
-    caps.ibMaxPkeys = static_cast<uint16_t>(mlxGetBits(cap, 0x190, 16));
-    if (!caps.numPorts) caps.numPorts = 1;
+    caps.ibMaxPkeys = static_cast<uint16_t>(
+        mlxP1PkeyTableSize(parsed.pkeyTableEncoding));
+    if (!caps.numPorts || !caps.maxQp || !caps.maxCq || !caps.maxMr) {
+        IOFree(flow, MLX_P1_HCA_CAP_BYTES);
+        IOFree(roce, MLX_P1_HCA_CAP_BYTES);
+        IOFree(general, MLX_P1_HCA_CAP_BYTES);
+        IOFree(ethernet, MLX_P1_HCA_CAP_BYTES);
+        return false;
+    }
+    IOFree(flow, MLX_P1_HCA_CAP_BYTES);
+    IOFree(roce, MLX_P1_HCA_CAP_BYTES);
+    IOFree(general, MLX_P1_HCA_CAP_BYTES);
+    IOFree(ethernet, MLX_P1_HCA_CAP_BYTES);
     IOLog("MlxPCIDriver: capability query complete\n");
     return true;
+}
+
+bool MlxPCIDriver::queryHcaCap(uint16_t type, uint16_t mode,
+                               uint8_t *capability)
+{
+    if (!capability)
+        return false;
+    uint8_t in[MLX_P1_QUERY_HCA_CAP_IN_BYTES] = {};
+    uint8_t *out = static_cast<uint8_t *>(
+        IOMallocZero(MLX_P1_QUERY_HCA_CAP_OUT_BYTES));
+    if (!out)
+        return false;
+    mlxP1EncodeQueryHcaCap(in, sizeof(in), type, mode);
+    MlxCmdInOut cmd = { in, sizeof(in), out,
+                        MLX_P1_QUERY_HCA_CAP_OUT_BYTES,
+                        MLX_CMD_OP_QUERY_HCA_CAP };
+    IOReturn kr = fCmd->exec(&cmd, 5000);
+    if (kr == kIOReturnSuccess)
+        memcpy(capability, out + MLX_P1_CMD_HEADER_BYTES,
+               MLX_P1_HCA_CAP_BYTES);
+    IOFree(out, MLX_P1_QUERY_HCA_CAP_OUT_BYTES);
+    return kr == kIOReturnSuccess;
 }
 
 bool MlxPCIDriver::negotiateRoceCap()
@@ -449,9 +639,32 @@ bool MlxPCIDriver::publishNubs()
         setProperty("mlx_rdma", true);
     else
         removeProperty("mlx_rdma");
-    setProperty("mlx_eth", !fHCA->caps().isIB());
+    if (fHCA->caps().isEthernet() && fHCA->caps().ethNetOffloads &&
+        fHCA->caps().nicFlowTable && fEQ && fEQ->getNumCompEqs() > 0)
+        setProperty("mlx_eth", true);
+    else
+        removeProperty("mlx_eth");
     setProperty("deviceName", fDevName);
     return true;
+}
+
+void MlxPCIDriver::enterDmaQuarantine(uint32_t reason)
+{
+    fDmaQuarantined = true;
+    removeProperty("mlx_eth");
+    removeProperty("mlx_rdma");
+    if (fPci)
+        fPci->setBusMasterEnable(false);
+    IOLog("MlxPCIDriver: DMA quarantine requested (reason=%u)\n", reason);
+}
+
+bool MlxPCIDriver::disableBusMasterAndVerify()
+{
+    if (!fPci)
+        return true;
+    fPci->setBusMasterEnable(false);
+    uint16_t command = fPci->configRead16(kIOPCIConfigCommand);
+    return (command & 0x0004) == 0;
 }
 
 bool MlxPCIDriver::rocePublicationAllowed() const

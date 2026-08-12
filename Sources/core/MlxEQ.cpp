@@ -13,6 +13,7 @@
 #include "MlxCmd.hpp"
 #include "MlxRegs.hpp"
 #include "MlxKernelCompat.hpp"
+#include "MlxP1Encoding.hpp"
 
 #include <string.h>
 
@@ -41,23 +42,9 @@ free_eq_entry(MlxEqEntry *eq)
 bool MlxEQ::shutdown()
 {
     bool allDestroyed = true;
-    if (fAsyncIS) {
-        fAsyncIS->disable();
-        if (fWorkLoop) fWorkLoop->removeEventSource(fAsyncIS);
-        fAsyncIS->release();
-        fAsyncIS = NULL;
-    }
-    if (fCompIS) {
-        for (uint32_t i = 0; i < fNumCompEqs; i++) {
-            if (!fCompIS[i])
-                continue;
-            fCompIS[i]->disable();
-            if (fWorkLoop) fWorkLoop->removeEventSource(fCompIS[i]);
-            fCompIS[i]->release();
-            fCompIS[i] = NULL;
-        }
-    }
-
+    fShuttingDown = true;
+    disableInterrupts();
+    synchronizeCallbacks();
     if (fOwner && fOwner->getCmd() && fOwner->getCmd()->isUp()) {
         for (uint32_t i = 0; i < fNumCompEqs; i++) {
             if (fCompEqs && fCompEqs[i].valid) {
@@ -82,6 +69,29 @@ bool MlxEQ::shutdown()
             allDestroyed &= !fAsyncEqs || !fAsyncEqs[i].valid;
     }
     return allDestroyed;
+}
+
+void MlxEQ::disableInterrupts()
+{
+    if (fAsyncIS) {
+        fAsyncIS->disable();
+        if (fWorkLoop) fWorkLoop->removeEventSource(fAsyncIS);
+        fAsyncIS->release();
+        fAsyncIS = NULL;
+    }
+    if (fCompIS) {
+        for (uint32_t i = 0; i < fNumCompEqs; i++) {
+            if (!fCompIS[i])
+                continue;
+            fCompIS[i]->disable();
+            if (fWorkLoop) fWorkLoop->removeEventSource(fCompIS[i]);
+            fCompIS[i]->release();
+            fCompIS[i] = NULL;
+        }
+        IOFree(fCompIS, sizeof(IOInterruptEventSource *) * fNumCompEqs);
+        fCompIS = NULL;
+    }
+    fInterruptsSetup = false;
 }
 
 void MlxEQ::markHardwareStopped()
@@ -114,10 +124,6 @@ void MlxEQ::free()
         }
         IOFree(fAsyncEqs, sizeof(MlxEqEntry) * fNumAsyncEqs);
         fAsyncEqs = NULL;
-    }
-    if (fCompIS) {
-        IOFree(fCompIS, sizeof(IOInterruptEventSource *) * fNumCompEqs);
-        fCompIS = NULL;
     }
     if (fWorkLoop) {
         fWorkLoop->release();
@@ -156,6 +162,9 @@ bool MlxEQ::init(MlxPCIDriver *owner, uint32_t numCompVectors)
     fCompEqs = NULL;
     fAsyncIS = NULL;
     fCompIS = NULL;
+    fInterruptsSetup = false;
+    fActiveCallbacks = 0;
+    fShuttingDown = false;
 
     fAsyncEqs = (MlxEqEntry *)IOMallocZero(sizeof(MlxEqEntry) * fNumAsyncEqs);
     fCompEqs = (MlxEqEntry *)IOMallocZero(sizeof(MlxEqEntry) * fNumCompEqs);
@@ -224,7 +233,7 @@ kern_return_t MlxEQ::allocEqBuf(MlxEqEntry *eq)
 }
 
 kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
-                              const uint32_t mask[4])
+                              const uint64_t mask[4])
 {
     /* See eq.c:272 create_map_eq */
     kern_return_t kr = allocEqBuf(eq);
@@ -250,9 +259,9 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
     mlxSetBits(eqc, 0xb4, 12, vecidx);
     mlxSetBits(eqc, 0xc3, 5, 0); /* 4 KiB pages */
 
-    /* event_bitmask (128-bit) */
+    /* event_bitmask is four 64-bit IFC words. */
     for (uint32_t i = 0; i < 4; i++)
-        OSWriteBigInt32(in, maskOffset + (i * 4), mask[i]);
+        OSWriteBigInt64(in, maskOffset + (i * 8), mask[i]);
 
     /* PAS (physical address list, 8 bytes each) */
     uint32_t numPages = eq->numPages;
@@ -265,11 +274,8 @@ kern_return_t MlxEQ::createEq(MlxEqEntry *eq, uint32_t vecidx,
     MlxCmdInOut cmd = { in, inSize, out, sizeof(out), MLX_CMD_OP_CREATE_EQ };
     kr = fOwner->getCmd()->exec(&cmd, 5000);
     if (kr != kIOReturnSuccess) {
-        eq->fDmaMap->clearMemoryDescriptor();
-        eq->fDmaMap->release();
-        eq->fDmaMap = NULL;
-        eq->fDesc->release();
-        eq->fDesc = NULL;
+        if (kr != kIOReturnTimeout)
+            free_eq_entry(eq);
         return kr;
     }
 
@@ -301,26 +307,31 @@ kern_return_t MlxEQ::createAsyncEqs()
      * [0] cmd_eq: CMD events only
      * [1] async_eq: generic async events
      * [2] pages_eq: PAGE_REQUEST */
-    uint32_t cmdMask[4] = {};
-    cmdMask[0] = 1u << (MLX_EVENT_TYPE_CMD & 31);
-    cmdMask[0] |= 1u << (MLX_EVENT_TYPE_PAGE_REQUEST & 31);
+    uint64_t cmdMask[4] = {};
+    mlxP1SetEvent(cmdMask, MLX_EVENT_TYPE_CMD);
 
     fAsyncEqs[0].logSize = 8;    /* 256 entries */
     kern_return_t kr = createEq(&fAsyncEqs[0], 0, cmdMask);
     if (kr != kIOReturnSuccess)
         return kr;
 
-    /* async_eq: generic mask (MVP: accept most async events) */
-    uint32_t asyncMask[4] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };
+    /* async_eq: only events with an explicit translation policy. */
+    uint64_t asyncMask[4] = {};
+    mlxP1SetEvent(asyncMask, MLX_EVENT_TYPE_WQ_CATAS_ERROR);
+    mlxP1SetEvent(asyncMask, MLX_EVENT_TYPE_PATH_MIG);
+    mlxP1SetEvent(asyncMask, MLX_EVENT_TYPE_COMM_EST);
+    mlxP1SetEvent(asyncMask, MLX_EVENT_TYPE_DEVICE_FATAL);
+    mlxP1SetEvent(asyncMask, MLX_EVENT_TYPE_PORT_STATE_CHANGE);
+    mlxP1SetEvent(asyncMask, MLX_EVENT_TYPE_NIC_VPORT_CHANGE);
     fAsyncEqs[1].logSize = 8;
     kr = createEq(&fAsyncEqs[1], 0, asyncMask);
     if (kr != kIOReturnSuccess)
         return kr;
 
     /* pages_eq: PAGE_REQUEST only */
-    uint32_t pagesMask[4] = {};
-    pagesMask[0] = 1u << (MLX_EVENT_TYPE_PAGE_REQUEST & 31);
-    fAsyncEqs[2].logSize = 0;    /* depth 1 */
+    uint64_t pagesMask[4] = {};
+    mlxP1SetEvent(pagesMask, MLX_EVENT_TYPE_PAGE_REQUEST);
+    fAsyncEqs[2].logSize = 7;    /* one request plus 128 spare EQEs */
     kr = createEq(&fAsyncEqs[2], 0, pagesMask);
     if (kr != kIOReturnSuccess)
         return kr;
@@ -331,8 +342,7 @@ kern_return_t MlxEQ::createAsyncEqs()
 kern_return_t MlxEQ::createCompEqs()
 {
     /* See create_comp_eqs (eq.c:969) */
-    uint32_t compMask[4] = {};
-    compMask[0] = 1u << MLX_EVENT_TYPE_COMPLETION;
+    uint64_t compMask[4] = {}; /* completion EQs use an empty event mask */
 
     for (uint32_t i = 0; i < fNumCompEqs; i++) {
         fCompEqs[i].logSize = 10;    /* 1024 entries */
@@ -348,6 +358,10 @@ void MlxEQ::registerNotifier(uint32_t eventType, MlxEventNotifier *n)
     if (eventType >= MLX_EVENT_TYPE_MAX)
         return;
     IOLockLock(fNotifierLock);
+    if (fShuttingDown) {
+        IOLockUnlock(fNotifierLock);
+        return;
+    }
     uint32_t count = fNotifierCounts[eventType];
     for (uint32_t i = 0; i < count; i++) {
         if (fNotifiers[eventType][i] == n) {
@@ -380,6 +394,14 @@ void MlxEQ::unregisterNotifier(uint32_t eventType, MlxEventNotifier *n)
     IOLockUnlock(fNotifierLock);
 }
 
+void MlxEQ::synchronizeCallbacks()
+{
+    IOLockLock(fNotifierLock);
+    while (fActiveCallbacks)
+        IOLockSleep(fNotifierLock, &fActiveCallbacks, THREAD_UNINT);
+    IOLockUnlock(fNotifierLock);
+}
+
 bool MlxEQ::isNewEqe(const MlxEqEntry *eq, const MlxEqe *eqe) const
 {
     /* See lib/eq.h:61:
@@ -396,11 +418,14 @@ void MlxEQ::updateCi(MlxEqEntry *eq, bool arm)
      *   write +0x40 (MLX_EQ_DOORBELL) when armed, otherwise +0x42 */
     uint32_t ci = (eq->consIndex & 0xFFFFFF) | (eq->eqNumber << 24);
     MlxUAR *uar = fOwner ? fOwner->getUAR() : NULL;
-    IOMemoryMap *map = uar ? uar->getUarMap() : NULL;
-    if (!map)
+    IOVirtualAddress uarAddress = uar ? uar->getUarVirtualAddress() : 0;
+    if (!uarAddress)
         return;
     uint32_t offset = eq->doorbellOffset + (arm ? 0 : 8);
-    mlxMMIOWrite32BE(map, offset, ci);
+    volatile uint32_t *reg = reinterpret_cast<volatile uint32_t *>(
+        static_cast<uintptr_t>(uarAddress) + offset);
+    *reg = OSSwapHostToBigInt32(ci);
+    OSSynchronizeIO();
 }
 
 void MlxEQ::handleAsyncEqe(uint32_t eqIdx)
@@ -417,16 +442,43 @@ void MlxEQ::handleAsyncEqe(uint32_t eqIdx)
         mlxMemoryBarrier();
         /* Dispatch to the notifier list (replaces atomic_notifier_call_chain) */
         uint32_t type = eqe->type;
+        if (type == MLX_EVENT_TYPE_DEVICE_FATAL && fOwner)
+            fOwner->enterDmaQuarantine(type);
         IOLockLock(fNotifierLock);
         uint32_t count = (type < MLX_EVENT_TYPE_MAX) ?
             fNotifierCounts[type] : 0;
+        MlxEventNotifier *targets[MLX_MAX_EVENT_NOTIFIERS] = {};
+        OSObject *targetObjects[MLX_MAX_EVENT_NOTIFIERS] = {};
         for (uint32_t n = 0; n < count; n++) {
-            MlxEventNotifier *nb = fNotifiers[type][n];
-            if (nb)
-                nb->handleEvent(type, eqe);
+            targets[n] = fNotifiers[type][n];
+            targetObjects[n] = targets[n] ? targets[n]->notifierObject() : NULL;
+            if (targets[n] && targetObjects[n] && !fShuttingDown) {
+                targetObjects[n]->retain();
+                fActiveCallbacks++;
+            } else {
+                targets[n] = NULL;
+                targetObjects[n] = NULL;
+            }
         }
         IOLockUnlock(fNotifierLock);
+        for (uint32_t n = 0; n < count; n++) {
+            MlxEventNotifier *nb = targets[n];
+            if (nb)
+                nb->handleEvent(type, eqe);
+            if (targetObjects[n])
+                targetObjects[n]->release();
+            if (nb) {
+                IOLockLock(fNotifierLock);
+                if (fActiveCallbacks)
+                    fActiveCallbacks--;
+                if (!fActiveCallbacks)
+                    IOLockWakeup(fNotifierLock, &fActiveCallbacks, false);
+                IOLockUnlock(fNotifierLock);
+            }
+        }
         eq->consIndex++;
+        if ((eq->consIndex & 63) == 0)
+            updateCi(eq, false);
     }
     updateCi(eq, true);
 }
@@ -448,14 +500,38 @@ void MlxEQ::handleCompEqe(uint32_t eqIdx)
          * MVP: dispatch to the COMPLETION notifier */
         IOLockLock(fNotifierLock);
         uint32_t count = fNotifierCounts[MLX_EVENT_TYPE_COMPLETION];
+        MlxEventNotifier *targets[MLX_MAX_EVENT_NOTIFIERS] = {};
+        OSObject *targetObjects[MLX_MAX_EVENT_NOTIFIERS] = {};
         for (uint32_t n = 0; n < count; n++) {
-            MlxEventNotifier *nb =
-                fNotifiers[MLX_EVENT_TYPE_COMPLETION][n];
-            if (nb)
-                nb->handleEvent(MLX_EVENT_TYPE_COMPLETION, eqe);
+            targets[n] = fNotifiers[MLX_EVENT_TYPE_COMPLETION][n];
+            targetObjects[n] = targets[n] ? targets[n]->notifierObject() : NULL;
+            if (targets[n] && targetObjects[n] && !fShuttingDown) {
+                targetObjects[n]->retain();
+                fActiveCallbacks++;
+            } else {
+                targets[n] = NULL;
+                targetObjects[n] = NULL;
+            }
         }
         IOLockUnlock(fNotifierLock);
+        for (uint32_t n = 0; n < count; n++) {
+            MlxEventNotifier *nb = targets[n];
+            if (nb)
+                nb->handleEvent(MLX_EVENT_TYPE_COMPLETION, eqe);
+            if (targetObjects[n])
+                targetObjects[n]->release();
+            if (nb) {
+                IOLockLock(fNotifierLock);
+                if (fActiveCallbacks)
+                    fActiveCallbacks--;
+                if (!fActiveCallbacks)
+                    IOLockWakeup(fNotifierLock, &fActiveCallbacks, false);
+                IOLockUnlock(fNotifierLock);
+            }
+        }
         eq->consIndex++;
+        if ((eq->consIndex & 63) == 0)
+            updateCi(eq, false);
     }
     updateCi(eq, true);
 }
@@ -511,11 +587,16 @@ kern_return_t MlxEQ::setupInterrupts()
         fCompIS[i] = IOInterruptEventSource::interruptEventSource(
             this, &MlxEQ::compIntrHandler,
             fOwner->getPCI(), (int)(i + 1));   /* vectors 1..N */
-        if (fCompIS[i]) {
-            if (fWorkLoop->addEventSource(fCompIS[i]) != kIOReturnSuccess)
-                return kIOReturnError;
-            fCompIS[i]->enable();
-        }
+        if (!fCompIS[i])
+            return kIOReturnNoResources;
+        if (fWorkLoop->addEventSource(fCompIS[i]) != kIOReturnSuccess)
+            return kIOReturnError;
+        fCompIS[i]->enable();
     }
+    for (uint32_t i = 0; i < fNumAsyncEqs; i++)
+        updateCi(&fAsyncEqs[i], true);
+    for (uint32_t i = 0; i < fNumCompEqs; i++)
+        updateCi(&fCompEqs[i], true);
+    fInterruptsSetup = true;
     return kIOReturnSuccess;
 }

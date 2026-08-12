@@ -61,6 +61,7 @@ public:
 
     /* EQ completion event: dispatch to TX/RX CQ polling (See mlx5e_completion_event) */
     virtual void handleEvent(uint32_t type, void *eqe) APPLE_KEXT_OVERRIDE;
+    virtual OSObject *notifierObject() APPLE_KEXT_OVERRIDE { return this; }
 
     /* RX path: called by the EQ completion interrupt after the hardware receives a packet */
     kern_return_t receivePacket(mbuf_t packet, UInt32 length);

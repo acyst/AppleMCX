@@ -60,8 +60,11 @@ struct MlxHcaCaps {
 
     /* hardware features */
     bool     uar4k;             /* 4K UAR support */
+    uint16_t logUarPageSize;    /* system page size relative to 4 KiB */
     uint8_t  logBfRegSize;      /* log2 bytes per BF register */
     bool     swRoceSrcUdpPort;  /* RoCEv2 source UDP port settable */
+    bool     nicFlowTable;      /* NIC RX/TX flow-table capability verified */
+    bool     ethNetOffloads;    /* Ethernet offload capability verified */
 
     /* IB capabilities (reserved for plan C) */
     uint16_t ibMaxLids;         /* LID table size */

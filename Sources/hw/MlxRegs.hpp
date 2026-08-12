@@ -31,18 +31,29 @@ struct MlxInitSeg {
     uint32_t cmdq_addr_l_sz;       /* +0x0014 low 12 bits: log_sz/log_stride */
     uint32_t cmd_dbell;            /* +0x0018 command doorbell ★ */
     uint32_t rsvd1[120];           /* +0x001C */
-    uint32_t initializing;         /* +0x0200 bit31 = firmware initializing */
+    uint32_t initializing;         /* +0x01FC bit31 = firmware initializing */
     struct MlxHealthBuffer {
-        uint32_t hw_health_counter; /* +0x0204 */
-        uint32_t fw_health_counter; /* +0x0208 */
-        uint32_t health_flags;      /* +0x020C */
-        uint32_t rsvd2[2];          /* +0x0210 */
-        uint32_t synd;              /* +0x0218 health error code */
-        uint32_t ext_synd;          /* +0x021C */
-        uint32_t rsvd3[100];
+        uint32_t assert_var[6];
+        uint32_t rsvd0[2];
+        uint32_t assert_exit_ptr;
+        uint32_t assert_callra;
+        uint32_t rsvd1;
+        uint32_t time;
+        uint32_t fw_ver;
+        uint32_t hw_id;
+        uint8_t rfr_severity;
+        uint8_t rsvd2[3];
+        uint8_t irisc_index;
+        uint8_t synd;
+        uint16_t ext_synd;
     } health;
-    uint32_t rsvd4[878];
+    uint32_t rsvd2[878];
     uint32_t cmd_exec_to;          /* command execution timeout */
+    uint32_t cmd_q_init_to;
+    uint32_t internal_timer_h;
+    uint32_t internal_timer_l;
+    uint32_t rsvd3[2];
+    uint32_t health_counter;
 };
 
 /* Command interface version (See CMD_IF_REV) */
@@ -163,17 +174,15 @@ enum {
     MLX_EVENT_TYPE_PATH_MIG       = 0x01,
     MLX_EVENT_TYPE_COMM_EST       = 0x02,
     MLX_EVENT_TYPE_SQ_DRAINED     = 0x03,
-    MLX_EVENT_TYPE_WQ_CATAS_ERROR = 0x06,
+    MLX_EVENT_TYPE_WQ_CATAS_ERROR = 0x05,
     MLX_EVENT_TYPE_CMD            = 0x0a,   /* command completion */
     MLX_EVENT_TYPE_PAGE_REQUEST   = 0x0b,   /* firmware requests pages */
     MLX_EVENT_TYPE_SRQ_LAST_WQE   = 0x13,
     MLX_EVENT_TYPE_SRQ_RQ_LIMIT   = 0x14,
-    MLX_EVENT_TYPE_NIC_VPORT_CHANGE = 0x1c,
+    MLX_EVENT_TYPE_NIC_VPORT_CHANGE = 0x0d,
     /* port/device-level events (See Linux device.h:354 mlx5_event) */
-    MLX_EVENT_TYPE_DEVICE_FATAL      = 0x22,
+    MLX_EVENT_TYPE_DEVICE_FATAL      = 0x08,
     MLX_EVENT_TYPE_PORT_STATE_CHANGE = 0x09,
-    MLX_EVENT_TYPE_CLIENT_REREGISTER = 0x30,
-    MLX_EVENT_TYPE_GID_CHANGE        = 0x08,
 };
 
 /*

@@ -262,6 +262,7 @@ void MlxEthernet::releaseResources()
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE,
                                            this);
+        fCore->getEQ()->synchronizeCallbacks();
         fNotifierRegistered = false;
     }
     if (fNic) {
@@ -363,8 +364,7 @@ IOReturn MlxEthernet::enable(IONetworkInterface *netif)
         goto fail_all;
     }
 
-    /* Register before arming the CQs. unregisterNotifier() synchronizes with
-     * any callback already executing during teardown. */
+    /* Register before arming the CQs. */
     if (!fCore->getEQ()) {
         kr = kIOReturnNotReady;
         goto fail_all;
@@ -393,6 +393,7 @@ fail_all:
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE,
                                            this);
+        fCore->getEQ()->synchronizeCallbacks();
         fNotifierRegistered = false;
     }
     flowKr = destroyRxFlowSteering();
@@ -427,6 +428,7 @@ IOReturn MlxEthernet::disable(IONetworkInterface *netif)
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_COMPLETION, this);
         fCore->getEQ()->unregisterNotifier(MLX_EVENT_TYPE_PORT_STATE_CHANGE,
                                            this);
+        fCore->getEQ()->synchronizeCallbacks();
         fNotifierRegistered = false;
     }
     kern_return_t flowKr = destroyRxFlowSteering();
@@ -1514,8 +1516,8 @@ void MlxEthernet::armCq(uint32_t cqn, uint32_t dbOffset, uint32_t armSn,
         return;
     MlxUAR *uar = fCore->getUAR();
     uint32_t *db = uar->getDbRecord();
-    IOMemoryMap *uarMap = uar->getUarMap();
-    if (!db || !uarMap)
+    IOVirtualAddress uarAddress = uar->getUarVirtualAddress();
+    if (!db || !uarAddress)
         return;
     uint32_t arm = ((armSn & 3) << 28) | (consumer & 0x00ffffff);
     db[dbOffset / 4 + 1] = OSSwapHostToBigInt32(arm);
@@ -1525,7 +1527,7 @@ void MlxEthernet::armCq(uint32_t cqn, uint32_t dbOffset, uint32_t armSn,
         OSSwapHostToBigInt32(cqn & 0x00ffffff)
     };
     volatile uint64_t *mmio = reinterpret_cast<volatile uint64_t *>(
-        static_cast<uintptr_t>(uarMap->getVirtualAddress()) + MLX_CQ_DOORBELL);
+        static_cast<uintptr_t>(uarAddress) + MLX_CQ_DOORBELL);
     *mmio = *reinterpret_cast<uint64_t *>(doorbell);
     OSSynchronizeIO();
 }

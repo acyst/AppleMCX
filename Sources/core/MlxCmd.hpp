@@ -120,6 +120,7 @@ public:
 
     /* Command interface state */
     bool isUp() const { return fUp; }
+    bool isQuarantined() const { return fQuarantined; }
     uint16_t cmdifRev() const { return fCmdifRev; }
     virtual void free() APPLE_KEXT_OVERRIDE;
 
@@ -155,6 +156,7 @@ private:
     uint8_t          fToken;
     IOSimpleLock    *fAllocLock;
     IOSimpleLock    *fTokenLock;
+    IOLock          *fPageLock;
     MlxCmdEnt       *fEntArr[MLX_MAX_COMMANDS];
     bool             fUp;
     bool             fQuarantined;
