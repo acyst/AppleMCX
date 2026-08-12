@@ -339,6 +339,7 @@ IOReturn MlxFwPages::takePages(uint16_t functionId, bool embedded,
     MlxCmdInOut cmd = { in, sizeof(in), out, outputSize,
                         MLX_CMD_OP_MANAGE_PAGES };
     IOReturn kr = fOwner->getCmd()->exec(&cmd, 5000);
+    uint32_t count = 0;
     if (kr == kIOReturnTimeout) {
         markFunctionAmbiguous(functionId, embedded);
         setFatal(kMlxFwPageFaultTakeTimeout);
@@ -346,7 +347,7 @@ IOReturn MlxFwPages::takePages(uint16_t functionId, bool embedded,
     }
     if (kr != kIOReturnSuccess)
         goto out;
-    uint32_t count = static_cast<uint32_t>(mlxGetBits(out, 0x40, 32));
+    count = static_cast<uint32_t>(mlxGetBits(out, 0x40, 32));
     if (count > requested) {
         kr = kIOReturnIOError;
         goto protocol;
